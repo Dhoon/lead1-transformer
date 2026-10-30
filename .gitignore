@@ -1,2 +1,11 @@
+# 원시 데이터는 저장소에 올리지 않는다.
 data/raw/*
 !data/raw/.gitkeep
+data/processed/
+
+# 학습 산출물
+runs/
+
+__pycache__/
+*.pyc
+.pytest_cache/
