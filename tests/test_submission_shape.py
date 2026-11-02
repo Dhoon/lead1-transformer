@@ -5,7 +5,7 @@ import torch
 
 from src.data.dataset import WindowDataset, inference_batches, inference_windows
 from src.data.day_patches import LogStandardizer, impute_missing
-from src.data.lead_loader import grid_from_frame
+from src.data.lead_loader import grid_from_frame, load_grid, save_grid
 from src.data.peer_groups import group_members
 from src.eval.kaggle_submission import make_submission
 from src.models.dual_context import DualContextTransformer
@@ -64,3 +64,13 @@ def test_end_to_end_test_inference_to_submission():
     assert sub.set_index("row_id").loc[missing_rows, "anomaly"].notna().all()
     with pytest.raises(ValueError):
         make_submission(prob, grid.row_id, grid.present, pd.concat([sample, pd.DataFrame({"row_id": [-5]})]))
+
+
+def test_grid_cache_round_trip(tmp_path):
+    df, meta = make_frame()
+    grid = grid_from_frame(df, meta)
+    save_grid(grid, tmp_path / "grid.npz")
+    loaded, _ = load_grid(tmp_path / "grid.npz")
+    for name in ("building_ids", "site_id", "primary_use", "values", "present", "anomaly", "row_id"):
+        np.testing.assert_array_equal(getattr(loaded, name), getattr(grid, name))
+    assert loaded.start == grid.start

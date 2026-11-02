@@ -109,11 +109,55 @@ def grid_from_frame(df: pd.DataFrame, meta: pd.DataFrame) -> LeadGrid:
     )
 
 
+def _source_stamp(path: Path) -> np.ndarray:
+    """원본 CSV가 바뀌었는지 판단하기 위한 (크기, 수정 시각)."""
+    st = path.stat()
+    return np.array([st.st_size, st.st_mtime_ns], dtype=np.int64)
+
+
+def save_grid(grid: LeadGrid, path: Path, stamp: np.ndarray | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = dict(
+        building_ids=grid.building_ids, site_id=grid.site_id, primary_use=grid.primary_use.astype(str),
+        values=grid.values, present=grid.present, row_id=grid.row_id,
+        start=np.array(str(grid.start.date())),
+    )
+    if grid.anomaly is not None:
+        arrays["anomaly"] = grid.anomaly
+    if stamp is not None:
+        arrays["source_stamp"] = stamp
+    np.savez_compressed(path, **arrays)
+
+
+def load_grid(path: Path) -> tuple[LeadGrid, np.ndarray | None]:
+    with np.load(path, allow_pickle=False) as z:
+        grid = LeadGrid(
+            building_ids=z["building_ids"], site_id=z["site_id"], primary_use=z["primary_use"],
+            values=z["values"], present=z["present"],
+            anomaly=z["anomaly"] if "anomaly" in z else None,
+            row_id=z["row_id"], start=pd.Timestamp(str(z["start"])),
+        )
+        stamp = z["source_stamp"] if "source_stamp" in z else None
+    return grid, stamp
+
+
 def load_split(raw_dir: str | Path, split: str, cache_dir: str | Path | None = None) -> LeadGrid:
-    """`train` 또는 `test` 분할을 격자로 읽는다."""
+    """`train` 또는 `test` 분할을 격자로 읽는다.
+
+    cache_dir가 있으면 `grid_{split}.npz`를 쓴다. 원본 CSV가 있으면 크기·수정 시각이 같을 때만 캐시를 쓰고,
+    원본 CSV가 없으면(예: GPU 서버에 data/processed만 복사한 경우) 캐시를 그대로 쓴다.
+    """
     raw_dir = Path(raw_dir)
-    df = pd.read_csv(raw_dir / f"{split}.csv")
+    csv = raw_dir / f"{split}.csv"
+    cache = None if cache_dir is None else Path(cache_dir) / f"grid_{split}.npz"
+    if cache is not None and cache.exists():
+        grid, stamp = load_grid(cache)
+        if not csv.exists() or (stamp is not None and np.array_equal(stamp, _source_stamp(csv))):
+            return grid
+    df = pd.read_csv(csv)
     meta = load_meta(raw_dir, split, None if cache_dir is None else Path(cache_dir))
     grid = grid_from_frame(df, meta)
     assert grid.values.shape[2] == HOURS
+    if cache is not None:
+        save_grid(grid, cache, _source_stamp(csv))
     return grid
