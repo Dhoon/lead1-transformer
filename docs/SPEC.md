@@ -1,6 +1,6 @@
 # SPEC — Kaggle LEAD 기반 Dual-Context Transformer 이상 탐지 연구
 
-> **문서 상태:** 연구 설계 초안 (Draft v0.8 — 실제 결측 0 대체 MVP 및 중앙값 보정 비교 실험 반영)  
+> **문서 상태:** 연구 설계 초안 (Draft v0.9 — 평가 건물 Peer를 학습 건물에서 매칭)  
 > **기준일:** 2026-11-02  
 > **주요 목표:** Kaggle LEAD 전력 소비 시계열에서 **Zone/Type 관계와 일별 소비 패턴**을 함께 학습하여, Train과 Test에서 **동일한 전체 Transformer**로 시간별 이상 점수를 예측한다.  
 > **표기:** **[확정]** = 대화에서 합의된 설계, **[초기 설정]** = 첫 실험에서 사용하기로 정한 하이퍼파라미터(최적 성능을 의미하지 않음), **[제안]** = 실험 옵션, **[미정]** = 후속 연구에서 결정할 사항.
@@ -35,7 +35,7 @@
 | 학습 데이터 | Kaggle LEAD `train.csv`의 **200개 건물**, 총 **1,048,574개 시간별 관측 행**(사용 데이터 기준), 정상/이상 레이블 제공 |
 | 테스트 데이터 | Kaggle LEAD `test.csv`의 **206개 건물**, 이상 레이블 비공개 |
 | 학습 방식 | **전체 Dual-Encoder + Decoder 모델을 시간별 이상 레이블로 End-to-End 지도학습** |
-| 추론 방식 | Train/Test에서 동일 아키텍처를 사용하며, Test의 **비라벨 전력량 및 Zone/Type 메타데이터**로 Context 구성 |
+| 추론 방식 | Train/Test에서 동일 아키텍처를 사용하며, Test 대상 건물의 Context는 **같은 Zone/Type의 Train 건물 전력량(레이블 미사용)**에서 매칭해 구성 |
 | 출력 단위 | **Day Token 1개 → 시간별 이상 점수 24개**, 입력 `T`일 → `T×24`개 점수 |
 | 공식 평가 지표 | **ROC-AUC** |
 
@@ -260,6 +260,7 @@ Decoder layer output
 - **[확정]** 기본 Encoder는 해당 Window **T일 전체에 대해 양방향 Self-Attention**을 수행한다. Encoder 날짜 Causal Mask나 Cross-Attention 날짜 Mask는 기본 모델에 사용하지 않는다.
 - **[주의 — 시간적 인과성]** Decoder의 Causal Self-Attention만으로 모델 전체가 인과적이 되는 것은 아니다. **Encoder가 T일 전체를 보므로 초기 날짜의 예측에도 해당 Window의 이후 날짜 소비 정보가 반영될 수 있다.** 이는 Window 전체를 관측한 다음 수행하는 **오프라인/사후 이상 탐지**를 기본 평가 설정으로 정할 때 허용된다. 추후 온라인 탐지를 목표로 하면 Encoder Prefix 또는 날짜 기준 시간 제약이 필요하다.
 - **[확정]** 대상 건물이 각 그룹에 포함되므로 대상 Token이 그룹의 날짜별 첫 번째다. Peer 건물이 하나도 없다면 대상 건물 단독 Context가 입력된다.
+- **[확정]** Peer는 항상 **학습 건물 집합**에서 가져온다. 학습 시에는 대상 건물을 제외한 같은 Zone/Type의 학습 건물, 평가(검증/테스트) 시에는 같은 Zone/Type의 학습 건물 전체가 Peer다(6.1 참조).
 
 ### 4.6 Transformer 레이어 구성 및 초기 하이퍼파라미터
 
@@ -332,7 +333,10 @@ Decoder layer output
 ### 6.1 Test 입력과 출력
 
 - **[확정]** Test에서도 **Zone Encoder + Type Encoder + Temporal Decoder + Hourly Anomaly Head 전체**를 그대로 사용한다.
-- Train/Test 모두 Zone·Building Type 메타데이터와 서로 대응하는 날짜 범위가 있으므로, **각 데이터 분할에 포함된 건물의 비라벨 전력량으로 Peer 집합을 구성**할 수 있다.
+- **[확정]** Train/Test는 날짜 범위가 같고 건물은 서로 겹치지 않는다. 평가 대상 건물의 Encoder 그룹은 날짜별 첫 Token을 대상 건물로 두고, 나머지 Peer는 **학습 건물 중 같은 Zone/Type 건물의 동일 날짜 전력량**으로 구성한다(`peer_pool: train_only`). 학습 건물의 **레이블은 사용하지 않는다.**
+  - 학습 시와 같은 Peer 분포·그룹 크기를 유지하기 위한 선택이다. 예: Type 최대 그룹은 학습 80개, Test 81개(대상 포함).
+  - 학습 건물에 같은 Zone/Type이 없는 Test 건물(예: site 6, Retail, Utility, Warehouse/storage)은 해당 Encoder에서 대상 건물 단독 Context가 된다.
+  - 평가 건물끼리 Peer로 묶는 `within_split`, 학습+평가 건물을 모두 쓰는 `with_train`은 비교 옵션으로만 둔다.
 - Train의 레이블은 Loss 계산용이고, Test에는 레이블 없이 `meter_reading` 및 메타데이터만 사용한다.
 - Day Token 하나에서 시간별 24개 점수를 예측하며, 데이터셋의 실제 시간별 행으로 되돌려 **대회 제출 파일의 `row_id`와 이상 점수를 1:1 대응**시킨다.
 
@@ -363,7 +367,7 @@ Decoder layer output
 **[확정]** Train 200개 건물과 Test 206개 건물은 서로 다른 건물 집합이므로, 건물 일반화 성능을 검증하기 위해 **Building ID 기준** Train/Validation 분할을 사용한다.
 
 1. **내부 평가:** `GroupKFold` 또는 Building 단위 Holdout으로 `train.csv`의 건물을 분리한다. Validation Building의 이상 레이블은 학습에 쓰지 않는다.
-2. **전체 모델 학습:** 각 Fold의 Training Building에 대해 **Zone/Type Encoder + Decoder + Hourly Head를 공동 지도학습**하고, Validation Building의 전력량 및 메타데이터로 같은 형태의 Peer Context를 구성해 평가한다.
+2. **전체 모델 학습:** 각 Fold의 Training Building에 대해 **Zone/Type Encoder + Decoder + Hourly Head를 공동 지도학습**하고, Validation Building을 대상 건물로 두되 Peer는 **해당 Fold의 Training Building**에서 매칭하여(Test와 동일 규칙) 평가한다.
 3. **최종 제출:** 내부 검증이 끝난 뒤 Train 200개 건물 전체로 모델을 학습하고 Test 206개 건물의 시간별 이상 점수를 제출한다.
 
 - Train/Test의 **날짜 범위가 동일하다**고 해서 건물 ID를 섞어 학습하거나 정답 레이블을 Test에서 이용한다는 뜻은 아니다. 학습/검증/테스트 분할별 정답 정보의 경계를 지킨다.
@@ -470,6 +474,7 @@ eval:
   metric_primary: roc_auc
   metrics_secondary: [f1, precision, recall, pr_auc]
   split_unit: building_id
+  peer_pool: train_only                   # 평가 건물 Peer는 학습 건물에서 매칭 (within_split / with_train은 비교 옵션)
   inference_window_aggregation: to_be_decided
   kaggle_submission: row_id_level
 ```
@@ -534,7 +539,7 @@ eval:
 5. **평가 및 운영 범위:** 현재는 Encoder가 Window 전체를 보는 **오프라인/사후 탐지**. 미래 정보를 사용하지 않는 실시간/온라인 탐지는 후속 확장 여부 결정.
 6. **그룹 컨텍스트 설계:** Zone(`site_id`) / Type(`primary_use`)의 Proxy 적합성, Group이 작거나 데이터가 누락된 건물에 대한 처리.
 
-**이미 확정한 항목:** Train/Test 동일 전체 모델, Hourly Supervised Loss, Zone → Type 순차 Cross-Attention, Attention마다 FFN, 날짜별 공유 PE, `T∈[1,64]` Uniform Sampling, **MVP 결측 0 대체 및 중앙값 보정 비교 버전**. 위 항목들을 다시 미정으로 표시하지 않는다.
+**이미 확정한 항목:** Train/Test 동일 전체 모델, Hourly Supervised Loss, Zone → Type 순차 Cross-Attention, Attention마다 FFN, 날짜별 공유 PE, `T∈[1,64]` Uniform Sampling, **MVP 결측 0 대체 및 중앙값 보정 비교 버전**, **평가 건물 Peer는 학습 건물에서 매칭**. 위 항목들을 다시 미정으로 표시하지 않는다.
 
 ---
 

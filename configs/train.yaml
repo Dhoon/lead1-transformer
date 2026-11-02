@@ -69,7 +69,7 @@ eval:
   metric_primary: roc_auc
   metrics_secondary: [f1, precision, recall, pr_auc]
   split_unit: building_id
-  peer_pool: within_split                 # 평가 건물 Peer는 같은 분할(검증/테스트) 건물에서만 / with_train
+  peer_pool: train_only                   # 평가 건물 Peer: train_only(학습 건물에서 매칭) | within_split | with_train
   window_days: [64, 32, 14, 7, 1]         # E6 고정 길이 평가. 첫 값을 제출에 사용
   stride_days: null                       # [미정] null = window와 같음(겹침 없음). 작으면 겹치는 Window 평균
   inference_window_aggregation: mean      # 한 행에 여러 Window가 겹치면 확률 평균

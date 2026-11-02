@@ -26,7 +26,12 @@ from src.train.common import (
 )
 
 LOSS_POLICIES = ("include", "exclude_missing")
-PEER_POOLS = ("within_split", "with_train")
+# 평가(검증/테스트) 대상 건물의 Peer를 어디서 가져오는가. 레이블은 어느 경우에도 쓰지 않는다.
+PEER_POOLS = {
+    "train_only": "학습 건물에서만 매칭 (학습 때와 같은 Peer 분포)",
+    "within_split": "같은 분할의 평가 건물끼리",
+    "with_train": "학습 건물 + 평가 건물",
+}
 
 
 def hourly_loss(logits, target, mask, pos_weight=None):
@@ -82,8 +87,12 @@ def prepare(cfg: dict, fold: int, model_cfg: ModelConfig):
     label_mask[eval_idx] = False  # 검증/테스트 정답은 학습에 쓰지 않는다.
 
     if ev["peer_pool"] not in PEER_POOLS:
-        raise ValueError(f"peer_pool must be one of {PEER_POOLS}")
-    eval_pool = eval_idx if ev["peer_pool"] == "within_split" else np.concatenate([train_idx, eval_idx])
+        raise ValueError(f"peer_pool must be one of {list(PEER_POOLS)}")
+    eval_pool = {
+        "train_only": train_idx,
+        "within_split": eval_idx,
+        "with_train": np.concatenate([train_idx, eval_idx]),
+    }[ev["peer_pool"]]
     tz, tt = build_groups(grid, train_idx, train_idx, model_cfg)
     ez, et = build_groups(grid, eval_idx, eval_pool, model_cfg)
     ds_train = WindowDataset(x, train_idx, tz, tt, observed, labels, label_mask)
