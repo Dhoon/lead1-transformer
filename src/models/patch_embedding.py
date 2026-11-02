@@ -1,4 +1,4 @@
-"""하루 24시간 -> Day Token 투영 `Linear(24, D)` (SPEC 3.1)."""
+"""하루 24시간 -> Day Token 투영 `Linear(24, D)`과 날짜 PE (SPEC 3.1)."""
 from __future__ import annotations
 
 import math
@@ -19,16 +19,17 @@ class DayPatchEmbedding(nn.Module):
 
 
 class SinusoidalDayPE(nn.Module):
-    """Decoder 날짜 토큰 순서용 Positional Encoding. Window 내 위치 1..T를 표현한다."""
+    """Window 내 날짜 d=1..T의 Sinusoidal PE. 같은 날짜의 모든 건물 Token에 같은 벡터를 더한다."""
 
-    def __init__(self, d_model: int, max_len: int = 512):
+    def __init__(self, d_model: int, max_days: int = 512):
         super().__init__()
-        pos = torch.arange(max_len).unsqueeze(1)
+        pos = torch.arange(1, max_days + 1).unsqueeze(1)
         div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, d_model)
+        pe = torch.zeros(max_days, d_model)
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer("pe", pe, persistent=False)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return tokens + self.pe[: tokens.shape[-2]]
+    def forward(self, t: int) -> torch.Tensor:
+        """`[T, D]`: 행 d-1이 PE(d)."""
+        return self.pe[:t]

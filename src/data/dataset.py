@@ -1,91 +1,144 @@
-"""(대상 건물, 종료 날짜) 단위 Window Dataset. SPEC 3.3의 Tensor 규약을 따른다."""
+"""가변 길이 T일 Window Dataset, 샘플러, Collate (SPEC 3.3, 7.3)."""
 from __future__ import annotations
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
-
-IGNORE_INDEX = -100
+from torch.utils.data import Dataset, Sampler
 
 
 class WindowDataset(Dataset):
-    """대상 건물의 연속 T일과, 같은 날짜의 Zone/Type Peer 24시간 벡터를 묶는다.
+    """키 `(target_pos, start, T)` -> 대상 건물과 Zone/Type 그룹의 같은 연속 T일.
 
-    x, valid: 전체 격자 `[n_all, n_days, 24]`. x는 정규화·결측 대체가 끝난 값이다.
-    targets: 대상 건물 행 인덱스. zone_idx / type_idx: `[len(targets), G]` Peer 행 인덱스(-1 = 패딩), None이면 생략.
-    end_days: Window의 마지막 날짜. 시작 이전 날짜는 결측 날짜로 채운다.
-
-    Pretraining: `class_index`(대상별 클래스)와 `day_ok`(손실을 줄 날짜) `[n_all, n_days]`를 준다.
-    Downstream: `labels`와 `label_mask` `[n_all, n_days, 24]`를 준다.
-    Building ID는 정답(`building_target`)으로만 반환하며 입력 Tensor에는 들어가지 않는다.
+    x: 결측 대체·정규화가 끝난 전체 격자 `[n_all, n_days, 24]` (NaN 없음).
+    targets: 대상 건물 행 인덱스. zone_idx / type_idx: `[len(targets), G]` (열 0 = 대상 건물, -1 = 패딩).
+    labels / label_mask: Train에서만 준다. observed: `observation_mask` 보관용 (모델 입력 아님).
     """
 
     def __init__(
         self,
         x: np.ndarray,
-        valid: np.ndarray,
         targets: np.ndarray,
-        window: int,
-        end_days,
-        zone_idx: np.ndarray | None = None,
-        type_idx: np.ndarray | None = None,
-        class_index: np.ndarray | None = None,
-        day_ok: np.ndarray | None = None,
+        zone_idx: np.ndarray | None,
+        type_idx: np.ndarray | None,
+        observed: np.ndarray,
         labels: np.ndarray | None = None,
         label_mask: np.ndarray | None = None,
-        shuffle_pool: np.ndarray | None = None,
-        seed: int = 0,
     ):
-        pad = window - 1
-        self.window = window
-        self.x = np.concatenate([np.zeros_like(x[:, :pad]), x], axis=1)
-        self.valid = np.concatenate([np.zeros_like(valid[:, :pad]), valid], axis=1)
+        self.x, self.observed = x, observed
         self.targets = np.asarray(targets)
         self.zone_idx, self.type_idx = zone_idx, type_idx
-        self.class_index = class_index
-        self.day_ok = None if day_ok is None else np.concatenate([np.zeros_like(day_ok[:, :pad]), day_ok], axis=1)
-        self.labels = None if labels is None else np.concatenate([np.zeros_like(labels[:, :pad]), labels], axis=1)
-        self.label_mask = (
-            None if label_mask is None else np.concatenate([np.zeros_like(label_mask[:, :pad]), label_mask], axis=1)
-        )
-        # Context permutation 실험(SPEC 5.3, E7): Peer를 같은 수의 무작위 건물로 바꾼다.
-        self.shuffle_pool = shuffle_pool
-        self.rng = np.random.default_rng(seed)
-        self.end_days = np.asarray(list(end_days))
-        self.samples = [(i, int(e)) for i in range(len(self.targets)) for e in self.end_days]
+        self.labels, self.label_mask = labels, label_mask
+
+    @property
+    def n_days(self) -> int:
+        return self.x.shape[1]
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.targets)
 
-    def _peers(self, idx: np.ndarray, target: int, sl: slice):
-        idx = idx.copy()
-        if self.shuffle_pool is not None:
-            n = int((idx >= 0).sum())
-            pool = self.shuffle_pool[self.shuffle_pool != target]
-            idx[:n] = self.rng.choice(pool, size=n, replace=False)
-        safe = np.where(idx < 0, 0, idx)
-        daily = self.x[safe, sl].transpose(1, 0, 2)  # [T, G, 24]
-        mask = (idx >= 0)[None, :] & self.valid[safe, sl].any(-1).T  # [T, G]
-        return torch.from_numpy(np.ascontiguousarray(daily)), torch.from_numpy(mask)
+    def _group(self, idx: np.ndarray, sl: slice):
+        members = idx[idx >= 0]
+        return torch.from_numpy(np.ascontiguousarray(self.x[members, sl].transpose(1, 0, 2)))  # [T, G, 24]
 
-    def __getitem__(self, k: int) -> dict:
-        i, e = self.samples[k]
-        t = int(self.targets[i])
-        sl = slice(e, e + self.window)  # 패딩 기준 인덱스: 원래 날짜 e-T+1..e
+    def __getitem__(self, key) -> dict:
+        i, start, t = key
+        b = int(self.targets[i])
+        sl = slice(start, start + t)
         item = {
-            "target_daily": torch.from_numpy(self.x[t, sl]),
-            "day_valid_mask": torch.from_numpy(self.valid[t, sl]),
-            "target_row": t,
-            "end_day": e,
+            "target_daily": torch.from_numpy(self.x[b, sl]),
+            "observation_mask": torch.from_numpy(self.observed[b, sl]),
+            "target_row": b,
+            "start": start,
         }
         if self.zone_idx is not None:
-            item["zone_daily"], item["zone_mask"] = self._peers(self.zone_idx[i], t, sl)
+            item["zone_daily"] = self._group(self.zone_idx[i], sl)
         if self.type_idx is not None:
-            item["type_daily"], item["type_mask"] = self._peers(self.type_idx[i], t, sl)
-        if self.class_index is not None:
-            ok = self.day_ok[t, sl]
-            item["building_target"] = torch.from_numpy(np.where(ok, self.class_index[i], IGNORE_INDEX).astype(np.int64))
+            item["type_daily"] = self._group(self.type_idx[i], sl)
         if self.labels is not None:
-            item["hour_labels"] = torch.from_numpy(self.labels[t, sl].astype(np.float32))
-            item["label_mask"] = torch.from_numpy(self.label_mask[t, sl])
+            item["anomaly_target"] = torch.from_numpy(self.labels[b, sl].astype(np.float32))
+            item["label_mask"] = torch.from_numpy(self.label_mask[b, sl])
         return item
+
+
+def collate_windows(items: list[dict]) -> dict:
+    """같은 T끼리 묶인 배치를 받는다. 그룹 크기 차이만 Padding하고 `[B, T×G]` 유효 Token Mask를 만든다."""
+    t = items[0]["target_daily"].shape[0]
+    assert all(it["target_daily"].shape[0] == t for it in items), "배치 내 T가 같아야 한다."
+    out = {k: torch.stack([it[k] for it in items]) for k in ("target_daily", "observation_mask")}
+    out["target_row"] = torch.tensor([it["target_row"] for it in items])
+    out["start"] = torch.tensor([it["start"] for it in items])
+    for name in ("zone", "type"):
+        if f"{name}_daily" not in items[0]:
+            continue
+        groups = [it[f"{name}_daily"] for it in items]
+        g = max(x.shape[1] for x in groups)
+        daily = torch.zeros(len(items), t, g, 24)
+        member = torch.zeros(len(items), g, dtype=torch.bool)
+        for k, x in enumerate(groups):
+            daily[k, :, : x.shape[1]] = x
+            member[k, : x.shape[1]] = True
+        out[f"{name}_daily"] = daily
+        out[f"{name}_mask"] = member[:, None, :].expand(-1, t, -1).reshape(len(items), t * g)  # day-major
+    if "anomaly_target" in items[0]:
+        out["anomaly_target"] = torch.stack([it["anomaly_target"] for it in items])
+        out["label_mask"] = torch.stack([it["label_mask"] for it in items])
+    return out
+
+
+def batch_size_for(t: int, group_size: int, batch_size: int, max_tokens: int | None) -> int:
+    """긴 T에서 Encoder Token 수(T×G)가 커지므로 배치당 Token 예산으로 배치 크기를 줄인다."""
+    if not max_tokens:
+        return batch_size
+    return max(1, min(batch_size, max_tokens // (t * group_size)))
+
+
+class RandomWindowBatchSampler(Sampler):
+    """배치마다 T ~ Uniform{min_T..max_T}를 뽑고, 대상 건물과 시작 날짜를 무작위로 고른다.
+
+    한 배치 안의 샘플은 같은 T를 공유한다 (SPEC 7.3 구현 주의: 같은 길이끼리 배치 구성).
+    """
+
+    def __init__(
+        self, n_targets: int, n_days: int, min_t: int, max_t: int, samples_per_epoch: int,
+        batch_size: int, group_size: int, max_tokens: int | None, seed: int,
+    ):
+        self.n_targets, self.n_days = n_targets, n_days
+        self.min_t, self.max_t = min_t, min(max_t, n_days)
+        self.samples_per_epoch, self.batch_size = samples_per_epoch, batch_size
+        self.group_size, self.max_tokens = group_size, max_tokens
+        self.rng = np.random.default_rng(seed)
+
+    def __iter__(self):
+        seen = 0
+        while seen < self.samples_per_epoch:
+            t = int(self.rng.integers(self.min_t, self.max_t + 1))
+            b = batch_size_for(t, self.group_size, self.batch_size, self.max_tokens)
+            targets = self.rng.integers(0, self.n_targets, size=b)
+            starts = self.rng.integers(0, self.n_days - t + 1, size=b)
+            yield [(int(i), int(s), t) for i, s in zip(targets, starts)]
+            seen += b
+
+
+def inference_windows(n_days: int, window: int, stride: int) -> list[tuple[int, int]]:
+    """(start, T) 목록. 모든 날짜를 최소 한 번 덮으며, 마지막 Window는 남은 날짜만큼 짧아질 수 있다."""
+    if not 0 < stride <= window:
+        raise ValueError("stride는 1 이상 window 이하여야 모든 날짜를 덮는다.")
+    window = min(window, n_days)
+    starts = list(range(0, n_days - window + 1, stride))
+    if starts[-1] + window < n_days:
+        starts.append(starts[-1] + stride if stride < window else starts[-1] + window)
+    return [(s, min(window, n_days - s)) for s in starts]
+
+
+def inference_batches(
+    n_targets: int, n_days: int, window: int, stride: int, batch_size: int, group_size: int, max_tokens: int | None
+) -> list[list[tuple[int, int, int]]]:
+    """모든 대상 건물 x 추론 Window를 같은 T끼리 배치로 묶는다."""
+    by_len: dict[int, list] = {}
+    for s, t in inference_windows(n_days, window, stride):
+        by_len.setdefault(t, []).extend((i, s, t) for i in range(n_targets))
+    batches = []
+    for t, keys in by_len.items():
+        b = batch_size_for(t, group_size, batch_size, max_tokens)
+        batches.extend(keys[k : k + b] for k in range(0, len(keys), b))
+    return batches

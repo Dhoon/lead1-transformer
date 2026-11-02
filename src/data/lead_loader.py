@@ -26,8 +26,8 @@ class LeadGrid:
     start: pd.Timestamp
 
     @property
-    def valid(self) -> np.ndarray:
-        """원래 관측된 시간값 여부 (`day_valid_mask`)."""
+    def observed(self) -> np.ndarray:
+        """`observation_mask`: 실제 meter_reading 관측 여부. 전처리/진단용이며 모델 입력이 아니다."""
         return ~np.isnan(self.values)
 
     @property

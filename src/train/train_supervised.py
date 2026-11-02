@@ -1,0 +1,179 @@
+"""전체 모델 End-to-End 시간별 이상 지도학습 + 추론 (SPEC 5, 6, 7).
+
+python -m src.train.train_supervised --config configs/train.yaml --fold 0    # 미학습 건물 검증
+python -m src.train.train_supervised --config configs/train.yaml --fold -1   # 200개 학습 -> test 206개 제출
+"""
+from __future__ import annotations
+
+import argparse
+import json
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from src.data.dataset import RandomWindowBatchSampler, WindowDataset, collate_windows, inference_batches
+from src.data.day_patches import LogStandardizer, impute_missing
+from src.data.lead_loader import concat_grids, load_split
+from src.data.splits import select_fold
+from src.eval.kaggle_submission import make_submission
+from src.eval.metrics import hourly_metrics
+from src.models.dual_context import DualContextTransformer, ModelConfig, model_inputs
+from src.train.common import (
+    build_groups, get_device, load_config, max_group_size, run_dir, set_seed, to_device,
+)
+
+LOSS_POLICIES = ("include", "exclude_missing")
+PEER_POOLS = ("within_split", "with_train")
+
+
+def hourly_loss(logits, target, mask, pos_weight=None):
+    """`[B, T, 24]` 시간별 BCE. mask가 False인 시점(정답 Row 없음 등)은 제외한다."""
+    loss = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight, reduction="none")
+    return (loss * mask).sum() / mask.sum().clamp(min=1)
+
+
+@torch.no_grad()
+def predict(model, dataset: WindowDataset, batches, device) -> np.ndarray:
+    """모든 Window의 시간별 확률을 행마다 평균해 한 행당 점수 1개를 만든다 (`[n_targets, n_days, 24]`)."""
+    model.eval()
+    pos = {int(t): i for i, t in enumerate(dataset.targets)}
+    total = np.zeros((len(dataset.targets), dataset.n_days, 24))
+    count = np.zeros((len(dataset.targets), dataset.n_days, 1))
+    loader = DataLoader(dataset, batch_sampler=batches, collate_fn=collate_windows)
+    for batch in loader:
+        prob = torch.sigmoid(model(**model_inputs(to_device(batch, device)))).cpu().numpy()
+        t = prob.shape[1]
+        for k, (row, start) in enumerate(zip(batch["target_row"].tolist(), batch["start"].tolist())):
+            total[pos[row], start : start + t] += prob[k]
+            count[pos[row], start : start + t] += 1
+    assert (count > 0).all(), "추론 Window가 덮지 못한 날짜가 있다."
+    return (total / count).astype(np.float32)
+
+
+def prepare(cfg: dict, fold: int, model_cfg: ModelConfig):
+    """격자 로딩 -> 결측 대체 -> 정규화 -> 그룹 구성. 통계는 Training Fold에서만 추정한다."""
+    data, ev = cfg["data"], cfg["eval"]
+    train_grid = load_split(data["raw_dir"], "train", data.get("cache_dir"))
+    if fold < 0:
+        test_grid = load_split(data["raw_dir"], "test", data.get("cache_dir"))
+        grid = concat_grids(train_grid, test_grid)
+        n_train = len(train_grid.building_ids)
+        train_idx, eval_idx = np.arange(n_train), n_train + np.arange(len(test_grid.building_ids))
+        labels = np.concatenate([train_grid.anomaly, np.zeros_like(test_grid.present, dtype=np.int8)])
+    else:
+        grid = train_grid
+        train_idx, eval_idx = select_fold(grid.building_ids, fold, cfg["cv"]["n_splits"], cfg["seed"])
+        labels = grid.anomaly
+
+    observed = grid.observed
+    filled = impute_missing(grid.values, data["missing_value_strategy"])  # NaN 없음
+    norm = LogStandardizer().fit(grid.values[train_idx], observed[train_idx])
+    x = norm.transform(filled)
+
+    policy = data["missing_reading_loss_policy"]
+    if policy not in LOSS_POLICIES:
+        raise ValueError(f"missing_reading_loss_policy must be one of {LOSS_POLICIES}")
+    label_mask = grid.present.copy()
+    if policy == "exclude_missing":
+        label_mask &= observed
+    label_mask[eval_idx] = False  # 검증/테스트 정답은 학습에 쓰지 않는다.
+
+    if ev["peer_pool"] not in PEER_POOLS:
+        raise ValueError(f"peer_pool must be one of {PEER_POOLS}")
+    eval_pool = eval_idx if ev["peer_pool"] == "within_split" else np.concatenate([train_idx, eval_idx])
+    tz, tt = build_groups(grid, train_idx, train_idx, model_cfg)
+    ez, et = build_groups(grid, eval_idx, eval_pool, model_cfg)
+    ds_train = WindowDataset(x, train_idx, tz, tt, observed, labels, label_mask)
+    ds_eval = WindowDataset(x, eval_idx, ez, et, observed)
+    return grid, ds_train, ds_eval, norm, eval_idx
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="configs/train.yaml")
+    ap.add_argument("--fold", type=int, default=None, help="-1 = 200개 전체 학습 후 test 예측")
+    args = ap.parse_args(argv)
+
+    cfg = load_config(args.config)
+    fold = cfg["cv"]["fold"] if args.fold is None else args.fold
+    set_seed(cfg["seed"])
+    device = get_device(cfg.get("device", "auto"))
+    tcfg, ev = cfg["train"], cfg["eval"]
+    if tcfg.get("normal_only", False):
+        raise ValueError("SPEC 5.1: 이상 시간을 포함한 날짜도 학습에 쓴다 (normal_only=false).")
+    model_cfg = ModelConfig.from_dict({**cfg["model"], "max_window_days": tcfg["max_window_days"]})
+
+    grid, ds_train, ds_eval, norm, eval_idx = prepare(cfg, fold, model_cfg)
+    train_group = max_group_size(ds_train.zone_idx, ds_train.type_idx)
+    eval_group = max_group_size(ds_eval.zone_idx, ds_eval.type_idx)
+    print(
+        f"fold={fold} train_buildings={len(ds_train)} eval_buildings={len(ds_eval)} "
+        f"max_group train={train_group} eval={eval_group} missing={cfg['data']['missing_value_strategy']}"
+    )
+
+    model = DualContextTransformer(model_cfg).to(device)
+    print(f"params={sum(p.numel() for p in model.parameters()):,}")
+    opt = torch.optim.AdamW(model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"])
+    pos_weight = tcfg.get("pos_weight")
+    pos_weight = None if pos_weight is None else torch.tensor(float(pos_weight), device=device)
+
+    windows = ev["window_days"] if isinstance(ev["window_days"], list) else [ev["window_days"]]
+    out = run_dir(cfg, fold)
+    history = []
+    for epoch in range(tcfg["epochs"]):
+        model.train()
+        sampler = RandomWindowBatchSampler(
+            len(ds_train), grid.n_days, tcfg["min_window_days"], tcfg["max_window_days"],
+            tcfg["samples_per_epoch"], tcfg["batch_size"], train_group, tcfg.get("max_tokens_per_batch"),
+            seed=cfg["seed"] + epoch,
+        )
+        loader = DataLoader(ds_train, batch_sampler=sampler, collate_fn=collate_windows, num_workers=cfg.get("num_workers", 0))
+        for step, batch in enumerate(loader):
+            batch = to_device(batch, device)
+            logits = model(**model_inputs(batch))
+            loss = hourly_loss(logits, batch["anomaly_target"], batch["label_mask"], pos_weight)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.get("grad_clip", 1.0))
+            opt.step()
+            if step % tcfg.get("log_every", 50) == 0:
+                print(f"epoch {epoch} step {step} T={logits.shape[1]} B={logits.shape[0]} loss {loss.item():.4f}")
+
+        if fold >= 0:
+            eval_grid = grid.subset(eval_idx)
+            keep = eval_grid.present
+            row = {"epoch": epoch}
+            for w in windows:
+                batches = inference_batches(
+                    len(ds_eval), grid.n_days, w, ev.get("stride_days") or w,
+                    tcfg["batch_size"], eval_group, tcfg.get("max_tokens_per_batch"),
+                )
+                prob = predict(model, ds_eval, batches, device)
+                row[f"T={w}"] = hourly_metrics(eval_grid.anomaly[keep], prob[keep], ev.get("threshold", 0.5))
+            history.append(row)
+            print(f"epoch {epoch} eval {json.dumps(row)}")
+            (out / "metrics.json").write_text(json.dumps(history, indent=2))
+
+    torch.save(
+        {"model_cfg": model_cfg.to_dict(), "model": model.state_dict(), "normalizer": norm.state_dict(), "config": cfg},
+        out / "model.pt",
+    )
+    if fold < 0:
+        w = windows[0]
+        batches = inference_batches(
+            len(ds_eval), grid.n_days, w, ev.get("stride_days") or w,
+            tcfg["batch_size"], eval_group, tcfg.get("max_tokens_per_batch"),
+        )
+        prob = predict(model, ds_eval, batches, device)
+        eval_grid = grid.subset(eval_idx)
+        sample = pd.read_csv(f"{cfg['data']['raw_dir']}/sample_submission.csv")
+        sub = make_submission(prob, eval_grid.row_id, eval_grid.present, sample)
+        sub.to_csv(out / "submission.csv", index=False)
+        print(f"saved {out / 'submission.csv'} ({len(sub)} rows)")
+
+
+if __name__ == "__main__":
+    main()

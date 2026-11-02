@@ -1,4 +1,4 @@
-"""Pretraining/Fine-tuning 공용 유틸."""
+"""학습/추론 공용 유틸."""
 from __future__ import annotations
 
 import random
@@ -9,7 +9,7 @@ import torch
 import yaml
 
 from src.data.lead_loader import LeadGrid
-from src.data.peer_groups import peer_index
+from src.data.peer_groups import group_members
 from src.models.dual_context import ModelConfig
 
 
@@ -34,14 +34,18 @@ def to_device(batch: dict, device: torch.device) -> dict:
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
-def build_peers(grid: LeadGrid, targets: np.ndarray, pool: np.ndarray, cfg: ModelConfig):
-    """site_id(Zone proxy)·primary_use(Type)로 Peer 행 인덱스를 만든다. ID 자체는 모델 입력이 아니다."""
-    zone = peer_index(grid.site_id, targets, pool, cfg.exclude_target_from_peers) if cfg.use_zone_encoder else None
-    typ = peer_index(grid.primary_use, targets, pool, cfg.exclude_target_from_peers) if cfg.use_type_encoder else None
+def build_groups(grid: LeadGrid, targets: np.ndarray, pool: np.ndarray, cfg: ModelConfig):
+    """site_id(Zone proxy)·primary_use(Type)로 그룹을 만든다. 열 0은 대상 건물. ID 자체는 모델 입력이 아니다."""
+    zone = group_members(grid.site_id, targets, pool) if "zone" in cfg.contexts else None
+    typ = group_members(grid.primary_use, targets, pool) if "type" in cfg.contexts else None
     return zone, typ
 
 
-def run_dir(cfg: dict, name: str, fold: int) -> Path:
-    out = Path(cfg.get("output_dir", "runs")) / name / ("full" if fold < 0 else f"fold{fold}")
+def max_group_size(*groups: np.ndarray | None) -> int:
+    return max([1] + [int((g >= 0).sum(1).max()) for g in groups if g is not None])
+
+
+def run_dir(cfg: dict, fold: int) -> Path:
+    out = Path(cfg.get("output_dir", "runs")) / ("full" if fold < 0 else f"fold{fold}")
     out.mkdir(parents=True, exist_ok=True)
     return out

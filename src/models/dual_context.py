@@ -1,14 +1,31 @@
-"""Dual-Context Transformer Backbone: Zone Encoder + Type Encoder + Temporal Decoder (SPEC 4)."""
+"""Dual-Context Transformer: Zone/Type Joint Encoder + Temporal Decoder + Hourly Head (SPEC 4)."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 import torch
 from torch import nn
 
+from src.models.hourly_head import HourlyAnomalyHead
 from src.models.patch_embedding import DayPatchEmbedding, SinusoidalDayPE
-from src.models.set_encoder import SetEncoder
+from src.models.set_encoder import JointDayEncoder
 from src.models.temporal_decoder import TemporalDecoder
+
+CONTEXTS = ("zone", "type")
+
+# SPEC 8.1에서 값이 하나로 확정된 키. 다른 값이 들어오면 구현과 SPEC이 어긋난 것이므로 거부한다.
+FIXED = {
+    "patch_size_hours": 24,
+    "id_lookup_embedding": False,
+    "decoder_window_days": "variable",
+    "encoder_joint_days": True,
+    "encoder_tokens_layout": "day_major",
+    "target_first_per_day": True,
+    "encoder_self_attention_temporal_mask": "none",
+    "cross_attention_temporal_mask": "none",
+    "cross_attention_fusion": "sequential",
+    "exclude_target_from_peers": False,
+}
 
 
 @dataclass
@@ -22,36 +39,34 @@ class ModelConfig:
     decoder_layers: int = 2
     dropout: float = 0.1
     layer_norm: str = "pre"
-    patch_size_hours: int = 24
-    decoder_window_days: int = 7
-    id_lookup_embedding: bool = False
-    encoder_positional_encoding: bool = False
-    decoder_positional_encoding: bool = True
+    encoder_positional_encoding: str = "shared_sinusoidal_day"  # none = E8 Ablation
+    decoder_positional_encoding: str = "sinusoidal_day"
     decoder_causal_mask: bool = True
-    cross_attention_fusion: str = "parallel"
-    exclude_target_from_peers: bool = True
-    # Ablation 스위치 (SPEC 5.3, 9: E1–E4, Context-only)
-    use_zone_encoder: bool = True
-    use_type_encoder: bool = True
-    share_patch_embedding: bool = True
-    target_input: bool = True
+    cross_attention_order: list[str] = field(default_factory=lambda: ["zone", "type"])  # E1–E3, E5
+    ffn_after_each_attention: bool = True
+    share_patch_embedding: bool = True  # [제안] Linear(24,D) 공유부터 시작
+    max_window_days: int = 64
 
     def __post_init__(self):
-        if self.id_lookup_embedding:
-            raise ValueError("SPEC 2.1 [확정]: Input-side Building ID Lookup Embedding은 사용하지 않는다.")
-        if self.encoder_positional_encoding:
-            raise ValueError("SPEC 4.2/4.3 [확정]: Zone/Type Encoder에는 Positional Encoding을 넣지 않는다.")
-        if self.patch_size_hours != 24:
-            raise ValueError("SPEC 3.1 [확정]: 하루 24시간 = 토큰 하나.")
         if self.d_model % self.n_heads:
             raise ValueError("d_model은 n_heads로 나누어떨어져야 한다.")
         if self.head_dim is not None and self.head_dim != self.d_model // self.n_heads:
             raise ValueError("head_dim은 d_model / n_heads와 같아야 한다.")
         if self.layer_norm not in ("pre", "post"):
             raise ValueError("layer_norm은 pre 또는 post.")
+        if self.encoder_positional_encoding not in ("shared_sinusoidal_day", "none"):
+            raise ValueError("encoder_positional_encoding: shared_sinusoidal_day | none")
+        if self.decoder_positional_encoding not in ("sinusoidal_day", "none"):
+            raise ValueError("decoder_positional_encoding: sinusoidal_day | none")
+        order = list(self.cross_attention_order)
+        if len(set(order)) != len(order) or not set(order) <= set(CONTEXTS):
+            raise ValueError(f"cross_attention_order는 {CONTEXTS}의 중복 없는 부분 순열이어야 한다.")
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "ModelConfig":
+        for key, value in FIXED.items():
+            if key in cfg and cfg[key] != value:
+                raise ValueError(f"SPEC 확정 항목 {key}={value!r}와 다르다: {cfg[key]!r}")
         names = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in cfg.items() if k in names})
 
@@ -60,34 +75,31 @@ class ModelConfig:
 
     @property
     def contexts(self) -> tuple[str, ...]:
-        return tuple(c for c, on in (("zone", self.use_zone_encoder), ("type", self.use_type_encoder)) if on)
+        return tuple(self.cross_attention_order)
 
 
 class DualContextTransformer(nn.Module):
-    """입력은 전력 소비량뿐이다. forward는 Building ID를 받지 않는다."""
+    """Train/Test 공통 전체 모델. 입력은 전력량뿐이며 forward는 Building ID를 받지 않는다."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
         d, norm_first = cfg.d_model, cfg.layer_norm == "pre"
-        self.patch = DayPatchEmbedding(d, cfg.patch_size_hours)
-        # Context별 모듈은 `zone_encoder`, `type_encoder`, `{context}_patch` 속성으로 등록한다.
+        self.patch = DayPatchEmbedding(d)
+        self.day_pe = SinusoidalDayPE(d, max_days=max(512, cfg.max_window_days))
+        enc_pe = self.day_pe if cfg.encoder_positional_encoding != "none" else None
         layers = {"zone": cfg.zone_encoder_layers, "type": cfg.type_encoder_layers}
+        # nn.ModuleDict의 "type" 키는 내장 메서드와 충돌하므로 `zone_encoder`/`type_encoder` 속성으로 등록한다.
         for c in cfg.contexts:
-            setattr(self, f"{c}_patch", self.patch if cfg.share_patch_embedding else DayPatchEmbedding(d))
-            setattr(self, f"{c}_encoder", SetEncoder(d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first))
-        self.day_pe = SinusoidalDayPE(d) if cfg.decoder_positional_encoding else nn.Identity()
+            patch = self.patch if cfg.share_patch_embedding else DayPatchEmbedding(d)
+            setattr(self, f"{c}_encoder", JointDayEncoder(
+                patch, enc_pe, d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first
+            ))
         self.decoder = TemporalDecoder(
             d, cfg.n_heads, cfg.d_ff, cfg.decoder_layers, cfg.dropout, norm_first,
-            cfg.contexts, cfg.cross_attention_fusion, cfg.decoder_causal_mask,
+            cfg.contexts, cfg.ffn_after_each_attention, cfg.decoder_causal_mask,
         )
-
-    def encode_context(self, name: str, daily: torch.Tensor, mask: torch.Tensor):
-        """daily: `[B, T, S, 24]`, mask: `[B, T, S]`. 날짜마다 독립적으로 건물 집합을 인코딩한다."""
-        b, t, s, _ = daily.shape
-        tokens = getattr(self, f"{name}_patch")(daily).reshape(b * t, s, -1)
-        enc = getattr(self, f"{name}_encoder")(tokens, mask.reshape(b * t, s))
-        return enc.reshape(b, t, s, -1), mask
+        self.head = HourlyAnomalyHead(d)
 
     def forward(
         self,
@@ -97,21 +109,21 @@ class DualContextTransformer(nn.Module):
         type_daily: torch.Tensor | None = None,
         type_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """target_daily: `[B, T, 24]` -> 날짜별 Decoder 상태 `[B, T, D]`."""
-        if not self.cfg.target_input:
-            target_daily = torch.zeros_like(target_daily)
-        h = self.day_pe(self.patch(target_daily))
+        """target_daily: `[B, T, 24]`, {zone,type}_daily: `[B, T, G, 24]`, mask: `[B, T×G]` -> logits `[B, T, 24]`."""
+        h = self.patch(target_daily)
+        if self.cfg.decoder_positional_encoding != "none":
+            h = h + self.day_pe(h.shape[1])
         given = {"zone": (zone_daily, zone_mask), "type": (type_daily, type_mask)}
         memories = {}
         for c in self.cfg.contexts:
             daily, mask = given[c]
-            if daily is None:
+            if daily is None or mask is None:
                 raise ValueError(f"{c} Encoder가 켜져 있으면 {c}_daily/{c}_mask가 필요하다.")
-            memories[c] = self.encode_context(c, daily, mask)
-        return self.decoder(h, memories)
+            memories[c] = (getattr(self, f"{c}_encoder")(daily, mask), mask)
+        return self.head(self.decoder(h, memories))
 
 
-def backbone_inputs(batch: dict) -> dict:
-    """Batch dict에서 모델 입력만 골라낸다. building_target 등 정답은 전달하지 않는다."""
+def model_inputs(batch: dict) -> dict:
+    """Batch dict에서 모델 입력만 골라낸다. 레이블·observation_mask·행 정보는 전달하지 않는다."""
     keys = ("target_daily", "zone_daily", "zone_mask", "type_daily", "type_mask")
     return {k: batch[k] for k in keys if k in batch}

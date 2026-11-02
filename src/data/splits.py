@@ -1,4 +1,4 @@
-"""Group-aware CV 및 기간 분리 (SPEC 7.2)."""
+"""Building-aware CV (SPEC 7.2)."""
 from __future__ import annotations
 
 import numpy as np
@@ -15,14 +15,8 @@ def building_folds(building_ids: np.ndarray, n_splits: int, seed: int) -> list[t
     return folds
 
 
-def select_fold(n_buildings: int, building_ids: np.ndarray, fold: int, n_splits: int, seed: int):
-    """fold < 0이면 전체 건물을 학습에 쓰고 검증 건물은 비운다 (공식 Kaggle 학습)."""
+def select_fold(building_ids: np.ndarray, fold: int, n_splits: int, seed: int):
+    """fold < 0이면 전체 건물을 학습에 쓰고 검증 건물은 비운다 (최종 제출 학습)."""
     if fold < 0:
-        return np.arange(n_buildings), np.array([], dtype=np.int64)
+        return np.arange(len(building_ids)), np.array([], dtype=np.int64)
     return building_folds(building_ids, n_splits, seed)[fold]
-
-
-def day_ranges(n_days: int, val_days: int) -> tuple[range, range]:
-    """Pretraining 내부 검증용 기간 분리. 마지막 `val_days`일을 검증 기간으로 둔다."""
-    cut = n_days - val_days
-    return range(0, cut), range(cut, n_days)

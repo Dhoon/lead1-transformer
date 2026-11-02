@@ -1,4 +1,4 @@
-"""hourly -> 24-hour Day Vector 변환과 정규화 (SPEC 3.1, 7.1)."""
+"""hourly -> 24-hour Day Vector 변환, 결측 대체, 정규화 (SPEC 3.1, 7.1)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 HOURS = 24
+MISSING_STRATEGIES = ("zero_fill", "building_median")
 
 
 def hourly_to_grid(
@@ -36,22 +37,42 @@ def hourly_to_grid(
     return out
 
 
+def impute_missing(values: np.ndarray, strategy: str) -> np.ndarray:
+    """결측 `meter_reading`을 원래 소비량 단위에서 값으로 대체한다. Attention Mask가 아니다.
+
+    zero_fill (V1): NaN -> 0. 실제 0 소비량은 그대로 둔다.
+    building_median (V2): NaN -> 해당 건물의 관측값 중앙값. 라벨은 쓰지 않는다.
+      관측이 하나도 없는 건물은 SPEC 7.1 [미정]이므로 0으로 둔다.
+    """
+    if strategy not in MISSING_STRATEGIES:
+        raise ValueError(f"missing_value_strategy must be one of {MISSING_STRATEGIES}")
+    observed = ~np.isnan(values)
+    if strategy == "zero_fill":
+        fill = np.zeros(values.shape[0], dtype=values.dtype)
+    else:
+        flat = values.reshape(values.shape[0], -1)
+        has_obs = observed.reshape(values.shape[0], -1).any(1)
+        fill = np.zeros(values.shape[0], dtype=values.dtype)
+        fill[has_obs] = np.nanmedian(flat[has_obs], axis=1)
+    return np.where(observed, values, fill[:, None, None]).astype(values.dtype)
+
+
 @dataclass
 class LogStandardizer:
-    """`log1p(meter_reading)` 후 학습 구간 통계로 표준화한다. 결측값은 0(=평균)으로 대체한다."""
+    """`log1p(meter_reading)` 후 Training Fold 관측값 통계로 표준화한다."""
 
     mean: float = 0.0
     std: float = 1.0
 
-    def fit(self, values: np.ndarray, valid: np.ndarray) -> "LogStandardizer":
-        logv = np.log1p(np.clip(values[valid], 0, None))
+    def fit(self, values: np.ndarray, observed: np.ndarray) -> "LogStandardizer":
+        logv = np.log1p(np.clip(values[observed], 0, None))
         self.mean = float(logv.mean())
         self.std = float(logv.std() + 1e-6)
         return self
 
-    def transform(self, values: np.ndarray, valid: np.ndarray) -> np.ndarray:
-        out = (np.log1p(np.clip(np.nan_to_num(values), 0, None)) - self.mean) / self.std
-        return np.where(valid, out, 0.0).astype(np.float32)
+    def transform(self, filled: np.ndarray) -> np.ndarray:
+        """filled: 결측 대체가 끝난 값 (NaN 없음)."""
+        return ((np.log1p(np.clip(filled, 0, None)) - self.mean) / self.std).astype(np.float32)
 
     def state_dict(self) -> dict:
         return {"mean": self.mean, "std": self.std}

@@ -5,49 +5,40 @@ import pytest
 import torch
 from torch import nn
 
-from src.data.dataset import IGNORE_INDEX, WindowDataset
-from src.models.dual_context import DualContextTransformer, ModelConfig, backbone_inputs
-from src.models.heads import BuildingIdHead
-from src.train.pretrain import id_loss
-from tests.conftest import random_batch, small_cfg
+from src.data.dataset import WindowDataset, collate_windows
+from src.models.dual_context import DualContextTransformer, ModelConfig, model_inputs
 
 
 def test_model_has_no_id_embedding_or_id_argument():
     model = DualContextTransformer(ModelConfig())
     assert not any(isinstance(m, nn.Embedding) for m in model.modules())
     params = inspect.signature(model.forward).parameters
-    assert not any("building" in p or p.endswith("_id") for p in params)
+    assert not any("building" in p or p.endswith("_id") or "anomaly" in p or "observation" in p for p in params)
     with pytest.raises(ValueError):
-        ModelConfig(id_lookup_embedding=True)
+        ModelConfig.from_dict({"id_lookup_embedding": True})
 
 
-def test_building_target_not_passed_to_model():
-    batch = random_batch()
-    batch["building_target"] = torch.zeros(3, 5, dtype=torch.long)
-    assert "building_target" not in backbone_inputs(batch)
-
-
-def test_dataset_input_is_readings_only():
+def test_labels_and_masks_not_passed_to_model():
     x = np.random.default_rng(0).normal(size=(3, 6, 24)).astype(np.float32)
+    labels = np.ones((3, 6, 24), dtype=np.int8)
     ds = WindowDataset(
-        x, np.ones_like(x, dtype=bool), np.array([2]), 3, [5],
-        class_index=np.array([7]), day_ok=np.ones((3, 6), dtype=bool),
+        x, np.array([0]), np.array([[0, 1]]), None, np.ones_like(x, dtype=bool),
+        labels, np.ones_like(x, dtype=bool),
     )
-    item = ds[0]
-    assert torch.equal(item["target_daily"], torch.from_numpy(x[2, 3:6]))
-    assert item["building_target"].tolist() == [7, 7, 7]
+    batch = collate_windows([ds[(0, 1, 3)]])
+    assert set(model_inputs(batch)) == {"target_daily", "zone_daily", "zone_mask"}
 
 
-def test_cross_entropy_sends_gradient_to_all_classes():
-    model = DualContextTransformer(small_cfg()).eval()
-    head = BuildingIdHead(32, 200)
-    logits = head(model(**random_batch(b=1)))
-    logits.retain_grad()
-    target = torch.full((1, 5), IGNORE_INDEX)
-    target[0, -1] = 1
-    id_loss(logits, target, "all_valid_days").backward()
-    grad = logits.grad[0, -1]
-    assert (grad.abs() > 0).all()
-    expected = torch.softmax(logits[0, -1], -1).detach() - torch.eye(200)[1]
-    assert torch.allclose(grad, expected, atol=1e-6)
-    assert (head.proj.weight.grad.abs().sum(1) > 0).all()
+def test_anomaly_hours_kept_in_inputs_and_targets():
+    """라벨에 근거해 입력이나 날짜를 제외·마스킹하지 않는다 (SPEC 5.1)."""
+    x = np.random.default_rng(1).normal(size=(2, 4, 24)).astype(np.float32)
+    labels = np.zeros((2, 4, 24), dtype=np.int8)
+    labels[0, 2, 5:9] = 1
+    ds = WindowDataset(
+        x, np.array([0]), np.array([[0, 1]]), None, np.ones_like(x, dtype=bool),
+        labels, np.ones_like(x, dtype=bool),
+    )
+    item = ds[(0, 0, 4)]
+    assert torch.equal(item["target_daily"], torch.from_numpy(x[0]))
+    assert item["anomaly_target"][2, 5:9].eq(1).all()
+    assert item["label_mask"].all()
