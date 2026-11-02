@@ -131,7 +131,18 @@ def main(argv=None):
 
     windows = ev["window_days"] if isinstance(ev["window_days"], list) else [ev["window_days"]]
     out = run_dir(cfg, fold)
-    history = []
+    primary = ev.get("metric_primary", "roc_auc")
+    history, best = [], None
+
+    def save(name: str, epoch: int, metrics: dict | None):
+        torch.save(
+            {
+                "model_cfg": model_cfg.to_dict(), "model": model.state_dict(), "normalizer": norm.state_dict(),
+                "config": cfg, "epoch": epoch, "metrics": metrics,
+            },
+            out / name,
+        )
+
     for epoch in range(tcfg["epochs"]):
         model.train()
         sampler = RandomWindowBatchSampler(
@@ -165,11 +176,13 @@ def main(argv=None):
             history.append(row)
             print(f"epoch {epoch} eval {json.dumps(row)}")
             (out / "metrics.json").write_text(json.dumps(history, indent=2))
-
-    torch.save(
-        {"model_cfg": model_cfg.to_dict(), "model": model.state_dict(), "normalizer": norm.state_dict(), "config": cfg},
-        out / "model.pt",
-    )
+            # best: 첫 번째 평가 길이(window_days[0])의 metric_primary 기준
+            score = row[f"T={windows[0]}"].get(primary)
+            if score is not None and (best is None or score > best):
+                best = score
+                save("best.pt", epoch, row)
+                print(f"epoch {epoch} new best {primary}={score:.4f} (T={windows[0]}) -> best.pt")
+        save("last.pt", epoch, history[-1] if history else None)
     if fold < 0:
         w = windows[0]
         batches = inference_batches(
