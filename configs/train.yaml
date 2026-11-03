@@ -2,7 +2,7 @@
 seed: 42
 device: auto
 num_workers: 0
-output_dir: runs
+output_dir: runs/v1                       # v0.9 기준 결과는 runs/fold0 (덮어쓰지 않도록 분리)
 
 cv:
   n_splits: 5
@@ -34,6 +34,10 @@ model:
   ffn_after_each_attention: true
   exclude_target_from_peers: false
   share_patch_embedding: true             # [제안] Linear(24,D) 공유부터 시작
+  target_role_embedding: true             # v1.0: Encoder Token에 대상/Peer Role Embedding (E14 = false)
+  same_building_attention_bias: true      # v1.0: Encoder Self-Attn에 β·1[같은 건물] (E13 = false)
+  same_building_bias_init: 0.0            # Layer·Head별 학습 스칼라 β의 초기값
+  encoder_peers: all                      # all = E4 / target_only = E1b (Encoder에 대상 건물만)
 
 data:
   raw_dir: data/raw
@@ -41,7 +45,7 @@ data:
   missing_value_strategy: zero_fill       # V1: NaN -> 0 / V2(E11): building_median
   preserve_observation_mask: true         # 전처리/진단용
   observation_mask_as_feature: false      # MVP 모델 입력에 결측 플래그 미전달
-  missing_reading_loss_policy: include    # [미정] include | exclude_missing
+  missing_reading_loss_policy: include    # [확정] SPEC 9.2. exclude_missing은 비교 옵션
 
 train:
   mode: supervised_end_to_end

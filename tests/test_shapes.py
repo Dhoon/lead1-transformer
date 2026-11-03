@@ -34,7 +34,11 @@ def test_initial_config_matches_spec():
     assert len(model.decoder.layers) == 2
     attn = model.decoder.layers[0].blocks[0]
     assert attn.num_heads == 4 and attn.head_dim == 32
-    assert model.zone_encoder.layers[0].linear1.out_features == 512
+    assert model.zone_encoder.layers[0].ffn[0].out_features == 512
+    # v1.0 (SPEC 4.2.1): Role Embedding + 동일 건물 Bias가 기본 Config에서 켜져 있다.
+    assert cfg.target_role_embedding and cfg.same_building_attention_bias and cfg.encoder_peers == "all"
+    assert model.zone_encoder.role.weight.shape == (2, 128)
+    assert model.zone_encoder.layers[0].attn.beta.shape == (4,)
     assert isinstance(model.head.proj, nn.Linear) and model.head.proj.out_features == 24
 
 

@@ -45,6 +45,11 @@ class ModelConfig:
     cross_attention_order: list[str] = field(default_factory=lambda: ["zone", "type"])  # E1–E3, E5
     ffn_after_each_attention: bool = True
     share_patch_embedding: bool = True  # [제안] Linear(24,D) 공유부터 시작
+    # v1.0 (SPEC 4.2.1). 기본값 False = v0.9 Encoder라서 이전 Checkpoint도 그대로 불러온다. configs/train.yaml에서 켠다.
+    target_role_embedding: bool = False  # E14
+    same_building_attention_bias: bool = False  # E13
+    same_building_bias_init: float = 0.0
+    encoder_peers: str = "all"  # all = E4 / target_only = E1b
     max_window_days: int = 64
 
     def __post_init__(self):
@@ -58,6 +63,8 @@ class ModelConfig:
             raise ValueError("encoder_positional_encoding: shared_sinusoidal_day | none")
         if self.decoder_positional_encoding not in ("sinusoidal_day", "none"):
             raise ValueError("decoder_positional_encoding: sinusoidal_day | none")
+        if self.encoder_peers not in ("all", "target_only"):
+            raise ValueError("encoder_peers: all | target_only")
         order = list(self.cross_attention_order)
         if len(set(order)) != len(order) or not set(order) <= set(CONTEXTS):
             raise ValueError(f"cross_attention_order는 {CONTEXTS}의 중복 없는 부분 순열이어야 한다.")
@@ -93,7 +100,8 @@ class DualContextTransformer(nn.Module):
         for c in cfg.contexts:
             patch = self.patch if cfg.share_patch_embedding else DayPatchEmbedding(d)
             setattr(self, f"{c}_encoder", JointDayEncoder(
-                patch, enc_pe, d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first
+                patch, enc_pe, d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first,
+                cfg.target_role_embedding, cfg.same_building_attention_bias, cfg.same_building_bias_init,
             ))
         self.decoder = TemporalDecoder(
             d, cfg.n_heads, cfg.d_ff, cfg.decoder_layers, cfg.dropout, norm_first,

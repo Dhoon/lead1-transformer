@@ -38,6 +38,9 @@ def build_groups(grid: LeadGrid, targets: np.ndarray, pool: np.ndarray, cfg: Mod
     """site_id(Zone proxy)·primary_use(Type)로 그룹을 만든다. 열 0은 대상 건물. ID 자체는 모델 입력이 아니다."""
     zone = group_members(grid.site_id, targets, pool) if "zone" in cfg.contexts else None
     typ = group_members(grid.primary_use, targets, pool) if "type" in cfg.contexts else None
+    if cfg.encoder_peers == "target_only":  # E1b: Encoder 경로는 두고 Peer만 뺀다
+        zone = None if zone is None else zone[:, :1]
+        typ = None if typ is None else typ[:, :1]
     return zone, typ
 
 
