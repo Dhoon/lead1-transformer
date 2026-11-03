@@ -1,7 +1,7 @@
 # SPEC — Kaggle LEAD 기반 Dual-Context Transformer 이상 탐지 연구
 
-> **문서 상태:** 연구 설계 초안 (Draft v0.9 — 평가 건물 Peer를 학습 건물에서 매칭)  
-> **기준일:** 2026-11-02  
+> **문서 상태:** 연구 설계 초안 (Draft v1.0 — Encoder에 동일 건물 Attention Bias·Target Role Embedding 추가, 결측 Loss 정책 include 확정)  
+> **기준일:** 2026-11-03  
 > **주요 목표:** Kaggle LEAD 전력 소비 시계열에서 **Zone/Type 관계와 일별 소비 패턴**을 함께 학습하여, Train과 Test에서 **동일한 전체 Transformer**로 시간별 이상 점수를 예측한다.  
 > **표기:** **[확정]** = 대화에서 합의된 설계, **[초기 설정]** = 첫 실험에서 사용하기로 정한 하이퍼파라미터(최적 성능을 의미하지 않음), **[제안]** = 실험 옵션, **[미정]** = 후속 연구에서 결정할 사항.
 
@@ -32,8 +32,8 @@
 
 | 구분 | 내용 |
 |---|---|
-| 학습 데이터 | Kaggle LEAD `train.csv`의 **200개 건물**, 총 **1,048,574개 시간별 관측 행**(사용 데이터 기준), 정상/이상 레이블 제공 |
-| 테스트 데이터 | Kaggle LEAD `test.csv`의 **206개 건물**, 이상 레이블 비공개 |
+| 학습 데이터 | Kaggle LEAD `train.csv`의 **200개 건물**, 총 **1,749,494개 시간별 행**, 정상/이상 레이블 제공 (이상 2.13%) |
+| 테스트 데이터 | Kaggle LEAD `test.csv`의 **206개 건물**, **1,800,567개 시간별 행**, 이상 레이블 비공개 |
 | 학습 방식 | **전체 Dual-Encoder + Decoder 모델을 시간별 이상 레이블로 End-to-End 지도학습** |
 | 추론 방식 | Train/Test에서 동일 아키텍처를 사용하며, Test 대상 건물의 Context는 **같은 Zone/Type의 Train 건물 전력량(레이블 미사용)**에서 매칭해 구성 |
 | 출력 단위 | **Day Token 1개 → 시간별 이상 점수 24개**, 입력 `T`일 → `T×24`개 점수 |
@@ -58,6 +58,8 @@
 - **[확정]** 하루의 24개 `meter_reading`을 `Linear(24,D)`로 투영하여 **Day Token 1개**로 만든다.
 - **[확정]** Zone Encoder/Type Encoder는 대상 건물을 포함한 그룹의 동일 `T`일 데이터를 **날짜 우선(day-major)으로 Flatten**하여 각각 통합 Self-Attention을 수행한다.
 - **[확정]** 각 Encoder의 **날짜별 첫 번째 Token은 Decoder 대상 건물의 해당 날짜 Day Token**이며, 동일 날짜 건물들에는 **동일한 날짜 PE**를 적용한다. 건물 순서용 PE는 없다.
+- **[확정]** 첫 번째 위치만으로는 Encoder가 대상 건물을 구별하지 못하므로, Encoder Token에 **Target Role Embedding**(대상/Peer 2종)을 더한다. 건물 ID가 아니므로 처음 보는 Test 건물에도 그대로 적용된다(4.2.1).
+- **[확정]** 건물 순서 PE가 없으면 Encoder는 **서로 다른 날짜의 두 Token이 같은 건물인지** 알 수 없다. 이를 위해 Encoder Self-Attention에 **동일 건물 Attention Bias** `β·1[b_i=b_j]`를 더한다. 실제 ID 값은 학습하지 않고 "같은 건물인가"만 전달하므로 건물 순서 불변성이 유지된다(4.2.1).
 - **[확정]** Decoder는 대상 건물의 Day Token 시퀀스를 Causal Masked Self-Attention으로 처리하고, **Zone → Type(Building Type) 순서**로 Cross-Attention을 적용한다. 각 Attention 뒤에는 FFN을 둔다. **Type → Zone**은 후속 Ablation 옵션이다.
 - **[확정]** Train과 Test에서 **Zone Encoder + Type Encoder + Decoder 전체를 사용**한다. `train.csv`의 이상 레이블로 **시간별 이상 탐지 End-to-End 지도학습**을 수행한다. Building ID Classification Pretraining 및 Decoder-only 전이는 기본 설계에서 제외한다.
 - **[확정]** `building_id`는 입력 데이터의 정렬, 동일 건물 추적, Peer 구성 및 Building 단위 평가 Split에만 사용하고, **Building ID Lookup Embedding 또는 숫자 ID Feature로 투입하지 않는다.** `D`는 건물 수와 독립적이다.
@@ -86,10 +88,11 @@
 **[확정]** Encoder와 Decoder 모두 **날짜(day)에 대해서만 Positional Encoding(PE)**을 적용한다:
 
 \[
-\mathbf z_{b,d}=\mathbf e_{b,d}+PE(d).
+\text{Decoder: }\mathbf z_{b,d}=\mathbf e_{b,d}+PE(d),\qquad
+\text{Encoder: }\mathbf z_{b,d}=\mathbf e_{b,d}+PE(d)+E_{\text{role}}(r_b),\quad r_b\in\{\text{target},\text{peer}\}.
 \]
 
-- **Zone/Type Encoder:** 같은 날짜 `d`의 서로 다른 건물 Token에는 **동일한** `PE(d)`를 더하고, 다른 날짜에는 **서로 다른** `PE(d)`를 더한다. 건물의 나열 순서를 나타내는 PE는 넣지 않는다.
+- **Zone/Type Encoder:** 같은 날짜 `d`의 서로 다른 건물 Token에는 **동일한** `PE(d)`를 더하고, 다른 날짜에는 **서로 다른** `PE(d)`를 더한다. 건물의 나열 순서를 나타내는 PE는 넣지 않는다. 대신 **Role Embedding**으로 대상 건물 여부만 표시한다(4.2.1).
 - **Temporal Decoder:** 대상 건물의 연속된 Day Token에 날짜 순서대로 `PE(d)`를 더한다.
 - **[초기 설정]** Sinusoidal PE를 사용하며, `D=128`에서 날짜마다 길이 128의 벡터를 만든다. 예를 들어 1일차의 4개 건물에는 모두 **같은** `PE(1)` 벡터를 더한다. 2일차에는 네 건물 모두 `PE(2)`를 더한다. 이는 '1일차에는 cos만, 2일차에는 sin만'을 더하는 것이 아니라, 매 날짜별로 sin/cos가 교차하는 **D차원 벡터**를 생성한다.
 
@@ -103,14 +106,14 @@ PE(d,2i+1)=\cos\left(\frac{d}{10000^{2i/D}}\right).
 - **[초기 설정 — V1]** `meter_reading`이 결측인 시간은 **0으로 대체(Zero-fill)**하여 길이 24의 Day Vector를 구성한다. 이는 **값 대체(value masking)**이며, 해당 시간/날짜를 Self-Attention에서 삭제하는 **Attention Mask가 아니다**. 결측이 아닌 실제 `0` 소비량은 변경하지 않는다.
 - **[비교 실험 — V2]** LEAD 대회 우승 솔루션을 참고하여 **건물별 관측값 중앙값(median)**으로 결측 시간을 대체하는 별도 버전을 구현한다. V1(0 대체)과 V2(중앙값 대체)의 이상 탐지 성능을 비교하며, 어느 방법이 우수한지는 **미정**이다.
 - **[초기 설정]** 결측 여부를 `observation_mask`로 전처리 단계에 보관하되, 두 버전 모두 **모델 입력 특징으로 직접 전달하지 않는다**. 값 대체 방식이 Building/Anomaly Shortcut이 되는지는 검증한다. 이상 레이블이 존재하는 시간이나 날짜를 **라벨에 근거해 제외·마스킹하지 않는다**.
-- **[미정]** 결측 `meter_reading`이 있는 행의 **지도학습 Loss 포함 여부** 및 관측 여부 Mask를 추가 입력으로 제공하는 확장 실험은 추후 결정한다. Padding용 Attention Mask와 결측 관측 Mask는 구분한다.
+- **[확정]** 결측 `meter_reading`이 있는 행도 **지도학습 Loss에 포함**한다(`missing_reading_loss_policy: include`). Train 결측 행(107,653개)은 모두 정상(0)이며, Loss에서 제외하면 모델이 대체값을 정상으로 배우지 못해 평가 시 결측 시간에 오탐이 몰린다(9.2). 관측 여부 Mask를 추가 입력으로 제공하는 확장은 미정이다. Padding용 Attention Mask와 결측 관측 Mask는 구분한다.
 
 ### 3.2 Zone/Type 구분
 
 - **[제안]** LEAD 데이터에서는 `site_id`를 **Zone의 대리 변수(proxy)**로 사용한다. `site_id`가 실제 지리적 Zone과 완전히 동일하다는 주장은 하지 않는다.
 - **[제안]** `primary_use`를 Building Type으로 사용한다.
 - Train과 Test 모두 Zone/Type 그룹 구성용 메타데이터를 사용한다. 그룹을 구성하기 위한 **건물 고유 ID 자체는 모델 입력 Feature로 넣지 않는다.**
-- **[확정]** 두 Encoder의 입력 단위도 24시간짜리 **Day Token**이며, Decoder가 사용하는 `T`일과 **같은 날짜 범위**를 사용한다. `T`일 × 그룹 건물 수만큼의 Token을 **하나의 Encoder Self-Attention 시퀀스**로 합친다. 각 날짜의 그룹에서 **대상 건물을 첫 번째**에 둔다. 시간(hour)별 별도 Encoder는 기본 설계에서 사용하지 않는다.
+- **[확정]** 두 Encoder의 입력 단위도 24시간짜리 **Day Token**이며, Decoder가 사용하는 `T`일과 **같은 날짜 범위**를 사용한다. `T`일 × 그룹 건물 수만큼의 Token을 **하나의 Encoder Self-Attention 시퀀스**로 합친다. 각 날짜의 그룹에서 **대상 건물을 첫 번째**에 두고 Role Embedding으로 표시한다. 그룹 구성원은 Window 내 모든 날짜에서 같으므로, 그룹 내 **열 위치(slot)**가 같은 Token은 같은 건물이다. 동일 건물 Bias는 이 slot 일치 여부로 계산하며 ID 값을 쓰지 않는다. 시간(hour)별 별도 Encoder는 기본 설계에서 사용하지 않는다.
 
 ### 3.3 입력/출력 Tensor 규약 (MVP 기본안)
 
@@ -119,9 +122,10 @@ PE(d,2i+1)=\cos\left(\frac{d}{10000^{2i/D}}\right).
 | `target_daily` | `[B, T, 24]` | 대상 건물별 연속 T일 전력량 |
 | `zone_daily` | `[B, T, Z, 24]` | 같은 Zone의 건물들(매 날짜 첫 번째는 대상 건물) |
 | `type_daily` | `[B, T, U, 24]` | 같은 Type의 건물들(매 날짜 첫 번째는 대상 건물) |
-| `zone_tokens` | `[B, T×Z, D]` | Day Projection + 날짜별 공유 PE + day-major Flatten |
-| `type_tokens` | `[B, T×U, D]` | Day Projection + 날짜별 공유 PE + day-major Flatten |
+| `zone_tokens` | `[B, T×Z, D]` | Day Projection + 날짜별 공유 PE + Role Embedding + day-major Flatten |
+| `type_tokens` | `[B, T×U, D]` | Day Projection + 날짜별 공유 PE + Role Embedding + day-major Flatten |
 | `zone_mask` / `type_mask` | `[B, T×Z]` / `[B, T×U]` | 그룹 크기 차이 및 패딩을 위한 Attention 유효성 Mask |
+| `zone_slot` / `type_slot` | `[T×Z]` / `[T×U]` | Token의 그룹 내 건물 위치(0 = 대상). 동일 건물 Bias `1[slot_i=slot_j]`와 Role(`slot=0`) 계산용이며 ID가 아니다 |
 | `observation_mask` | `[B, T, 24]` | 실제 meter reading 관측 여부(전처리 보관용; MVP 모델 입력에는 전달하지 않음) |
 | `anomaly_target` | `[B, T, 24]` | Train에서만 제공되는 시간별 0/1 이상 레이블 |
 | `anomaly_logits` | `[B, T, 24]` | Train/Test 공통: 시간별 이상 Logit |
@@ -144,11 +148,12 @@ PE(d,2i+1)=\cos\left(\frac{d}{10000^{2i/D}}\right).
                   |                                   |
             Linear(24,D)                        Linear(24,D)
                   |                                   |
-            Shared Day PE                       Shared Day PE
+     Shared Day PE + Role Emb            Shared Day PE + Role Emb
                   |                                   |
           Flatten [T×Z,D]                      Flatten [T×U,D]
                   |                                   |
           Zone Encoder × 2                     Type Encoder × 2
+     (Self-Attn + same-building bias)    (Self-Attn + same-building bias)
                   |                                   |
                   +-----> Decoder cross-attention <---+
                                     ^
@@ -181,13 +186,34 @@ X_Z=\big[\underbrace{z_{b,1},z_{2,1},z_{3,1},z_{4,1}}_{\text{1일차}},
 \underbrace{z_{b,T},z_{2,T},z_{3,T},z_{4,T}}_{\text{T일차}}\big]
 \]
 
-여기서 `z_{i,d} = Linear(x_{i,d}) + PE(d)`이며, 예시는 같은 Zone에 **대상 포함 4개 건물**이 있는 상황이다.
+여기서 `z_{i,d} = Linear(x_{i,d}) + PE(d) + E_role(r_i)`이며, 예시는 같은 Zone에 **대상 포함 4개 건물**이 있는 상황이다.
 
 - 날짜별로 Encoder를 따로 호출하지 않고 **`T×Z`개 토큰을 통합해 Self-Attention**을 수행한다.
-- 각 날짜 블록의 **첫 번째 Token은 해당 날짜의 Decoder 대상 건물 원본 전력량**을 투영한 벡터다.
+- 각 날짜 블록의 **첫 번째 Token은 해당 날짜의 Decoder 대상 건물 원본 전력량**을 투영한 벡터이며, `E_role(target)`이 더해진다.
 - **같은 날짜의 모든 건물 Token에 동일한 PE**, 서로 다른 날짜에는 서로 다른 PE를 더한다.
-- 건물 Token의 **나열 순서에는 별도 PE를 부여하지 않는다.** 따라서 같은 날짜 내부의 건물 순서를 바꿔도 (올바른 마스크와 함께) 학습 결과는 순열 등변/불변 특성을 유지한다.
-- 날짜와 건물 모두를 통합하므로 **건물 간 관계와 서로 다른 날짜 간 관계를 동시에 학습**한다.
+- 건물 Token의 **나열 순서에는 별도 PE를 부여하지 않는다.** Role Embedding과 동일 건물 Bias는 순서가 아니라 "대상인가", "같은 건물인가"만 표현하므로, **모든 날짜에서 같은 방식으로** Peer 순서를 바꾸면 (올바른 마스크와 함께) 최종 Prediction은 변하지 않는다.
+- 날짜와 건물 모두를 통합하고 동일 건물 Bias로 날짜 간 연결을 알려 주므로 **건물 간 관계와 동일 건물의 날짜 간 패턴을 동시에 학습**한다.
+
+#### 4.2.1 건물 동일성과 대상 건물 표시 (v1.0 설계 검토)
+
+**문제 1 — 날짜 간 동일 건물 연결이 없다.** v0.9 Encoder Token은 `e_{b,d}+PE(d)`뿐이다. 건물 ID Embedding도 건물 순서 PE도 없으므로, Encoder는 1일차의 어떤 Token과 2일차의 어떤 Token이 **같은 건물**에서 나왔는지 직접 알 수 없다. 예를 들어 건물 2와 3의 2일차 값을 서로 바꾼 상황 B는, 날짜별 소비량 집합이 상황 A와 같다. 그러면 상황 B는 2일차 Token의 나열 순서만 바꾼 것과 같고, 순서 정보가 없는 Self-Attention·Cross-Attention의 출력은 두 상황에서 같아진다. 즉 "건물 간 관계 + 동일 건물의 날짜 간 패턴"을 학습한다는 설계 의도를 v0.9 Encoder는 표현할 수 없다.
+
+**해결 — 동일 건물 Attention Bias [확정].** Encoder Self-Attention Logit에 같은 건물 Token 쌍에 대한 Bias를 더한다.
+
+\[
+A_{ij}=\frac{Q_iK_j^\top}{\sqrt{d_k}}+\beta^{(\ell,h)}\cdot\mathbb 1[b_i=b_j]
+\]
+
+- `b_i=b_j`는 그룹 내 slot이 같은지로 판정한다(3.2). **ID 값은 학습하지 않으므로** 처음 보는 Test 건물에도 적용된다.
+- "같은 건물인가"라는 관계만 쓰므로 Peer 순서 불변성이 유지된다.
+- **[초기 설정]** `β`는 Encoder Layer `ℓ`·Head `h`마다 학습하는 스칼라이며 0으로 초기화한다(초기에는 v0.9와 동일한 모델에서 출발).
+- **[구현 주의]** Bias 행렬은 `[T·G, T·G]`이며 Type 최대 그룹(T=64, G=80)에서 5,120×5,120이다. 이를 Head별로 만들면 메모리가 커지므로, Batch 공통 `[1,H,L,L]` Float Mask를 Padding Mask와 합쳐 SDPA에 넘기거나, 동일 건물 Logit만 따로 더하는 방식으로 구현한다.
+
+**문제 2 — 첫 번째 위치만으로는 대상 건물이 표시되지 않는다.** 건물 순서 PE가 없으므로 "날짜별 첫 Token = 대상 건물"이라는 규약은 Encoder에 아무 정보도 주지 않는다. Decoder가 자기 입력과 비슷한 Token을 찾아낼 수는 있지만 명시적인 정보는 아니다.
+
+**해결 — Target Role Embedding [확정].** Encoder Token에 `E_role(target)` 또는 `E_role(peer)`를 더한다(3.1). 학습 파라미터는 `2×D`개이며 건물 ID와 무관하다.
+
+**문제 3 — Encoder가 Peer를 실제로 쓰는지 확인되지 않았다.** 대상 건물의 전력량은 Decoder, Zone Encoder, Type Encoder 세 경로에 모두 들어간다. 따라서 모델이 Peer 관계를 쓰지 않고 대상 건물 정보만 세 경로로 반복 사용하는 방향으로 학습될 수 있다. 이를 구분하기 위해 9장에 **Decoder-only(E1)**, **대상 건물만 넣은 Encoder(E1b)**, **전체 Peer Encoder(E4)**를 별도 실험으로 둔다. E1b ≈ E4이면 Peer 기여가 없다는 뜻이다.
 
 ### 4.3 Type Encoder
 
@@ -197,9 +223,9 @@ Type Encoder도 같은 방식을 적용한다. 대상 건물 `b`와 같은 유�
 X_U=[\{z_{i,1}:i\in\mathcal U(b)\},\{z_{i,2}:i\in\mathcal U(b)\},\ldots,\{z_{i,T}:i\in\mathcal U(b)\}]
 \]
 
-- 입력 크기는 `[T×U,D]`; **각 날짜 블록 첫 번째는 Decoder 대상 건물의 동일 날짜 Token**이다.
+- 입력 크기는 `[T×U,D]`; **각 날짜 블록 첫 번째는 Decoder 대상 건물의 동일 날짜 Token**이며 Role Embedding으로 표시한다.
 - **날짜 공유 PE 사용**, 건물 나열 순서에 대한 PE는 사용하지 않는다.
-- `T×U` 전체에 대한 Joint Self-Attention을 수행한다.
+- `T×U` 전체에 대한 Joint Self-Attention을 수행하며, Zone Encoder와 같은 **동일 건물 Attention Bias**를 적용한다(4.2.1). `β`는 Encoder별로 따로 학습한다.
 - Zone/Type Encoder는 **서로 다른 Transformer 가중치**를 사용한다. **[제안]** 입력 `Linear(24,D)`만 공유하는 모델부터 시작하고, Projection을 분리하는 Ablation을 수행한다.
 
 ### 4.4 Temporal Decoder
@@ -322,6 +348,7 @@ Decoder layer output
 ### 5.3 정보 누출과 Shortcut 통제
 
 - **[확정]** `building_id` 자체, 정답 레이블, 이상 여부에 기반한 Mask를 모델 입력으로 전달하지 않는다. `site_id`, `primary_use`는 Encoder Peer 그룹을 구성하기 위한 메타데이터다.
+- **[확정]** Role Embedding(대상/Peer)과 동일 건물 Bias(같은 slot인가)는 **건물 ID의 값을 담지 않는 관계 정보**이므로 ID 입력 금지 원칙에 해당하지 않는다. 어떤 건물이든 같은 두 개의 Role 벡터와 같은 `β`를 공유한다.
 - 실측 결측(`meter_reading`이 NaN)은 이상 라벨과 **별개 문제**로 취급한다. **V1은 0 대체**, **V2는 건물별 관측 중앙값 대체**로 비교한다. 결측 자체와 0 대체 패턴이 Shortcut에 미치는 영향은 실험으로 확인하며, 관측 여부 Mask는 초기 모델 입력으로 사용하지 않는다.
 - 입력 날짜 전체를 결합해 처리하는 Encoder는 후속 날짜의 값을 이용할 수 있으므로 현재 모델의 시간별 예측은 **Window를 다 관측한 뒤 수행하는 사후 이상 탐지**로 정의한다. 온라인/실시간 인과적 탐지와 구분한다.
 - 학습 시 사용한 전처리 및 Zone/Type 그룹 구성 규칙을 Test에서도 동일하게 적용하되, Test 정답은 참조하지 않는다.
@@ -344,7 +371,7 @@ Decoder layer output
 
 - **[확정]** 공식 주지표는 **Hour-level ROC-AUC**다. 추가적으로 PR-AUC, F1, Precision, Recall을 내부 검증셋에서 측정한다.
 - Kaggle 테스트 정답 레이블은 공개되어 있지 않지만, **Late Submission에서 Public/Private Score가 실제 반환됨**을 확인했다. 다만 이 점수는 최종 외부 평가로 사용하고, 하이퍼파라미터 튜닝은 Train 기반 검증에서 수행한다.
-- 동일 행이 여러 Overlapping Window에 포함될 수 있으므로, 추론 시 **한 행당 최종 점수 1개**를 만드는 Window 선택/점수 집계 규칙을 고정해야 한다. 예: 해당 날짜가 Window 마지막에 오도록 Context를 구성하거나, 다중 Window의 점수를 사전에 정한 방식으로 통합한다. **[미정]** 최종 규칙.
+- **[확정]** 추론 시 366일을 **겹치지 않는 고정 길이 Window**(기본 `T=64`, 마지막 Window는 남은 날짜)로 잘라 넣어 **한 행당 점수 1개**를 만든다(`stride_days: null`). 겹치는 Window(`stride < window`)를 쓰면 같은 행의 확률을 평균한다. 366일 전체를 한 번에 넣지 않는다. 내부 검증은 `T ∈ {64,32,14,7,1}`로 비교하며, 첫 값(64)을 제출과 Best Checkpoint 선택에 쓴다.
 - Missing `meter_reading`이 있는 Test 행도 제출 대상에서 누락하지 않는다. **V1의 Test 입력도 Train과 동일하게 0으로 대체**하고(비교 V2에서는 건물별 중앙값 사용), 원래 `row_id`에 해당하는 이상 점수를 제출한다.
 
 ---
@@ -358,7 +385,7 @@ Decoder layer output
 - **[초기 설정 — 결측 처리 V1]** 관측되지 않은 `meter_reading`은 **0으로 값 대체**한다. 하루 중 일부 시간만 결측이어도 나머지 관측값은 유지하고, 24시간 길이의 Day Vector를 만든다. 이 단계에서 결측 시간이나 날짜를 Attention에서 제거하지 않는다.
 - **[비교 실험 — 결측 처리 V2]** 결측값을 해당 **건물의 유효 관측값 중앙값**으로 대체한다(LEAD 우승 솔루션 방식 참고). 검증·테스트 건물의 경우에도 **정답 라벨 없이 해당 건물의 관측값**에서 중앙값을 계산하는 오프라인 프로토콜을 사용한다. 유효 관측이 0개인 건물의 대체값은 예외 처리 정책을 추후 결정한다.
 - `observation_mask`(원본이 실제로 관측됐는지 여부)는 두 버전 모두 따로 보관하되, **MVP에서 Day Token의 추가 특징으로 넣지 않는다**. `0`은 실제 소비량일 수도 있으므로 Zero-fill을 '결측을 완벽히 숨기는 Mask'로 가정하지 않으며, Shortcut 가능성을 비교한다.
-- **[미정]** 관측값이 없는 시간의 Loss 제외 여부 및 관측 여부를 입력 특징으로 제공하는 추가 Ablation은 별도 결정한다.
+- **[확정]** 관측값이 없는 시간도 Loss에 포함한다(3.1, 9.2). **[미정]** 관측 여부를 입력 특징으로 제공하는 추가 Ablation.
 - **[미정]** 날씨·캘린더·건물 규모 등의 외생 Feature를 추가할지 여부. 첫 실험에는 추가하지 않아 모델 자체의 효과를 측정한다.
 - **[주의]** LEAD 우승 논문의 `value_chg_diff/ratio` 및 미래 시점 Shift Feature는 본 모델의 필수 입력이 아니며, 비교 Baseline에서만 사용한다. 기본 모델은 오프라인 사후 탐지로 정의하며, 향후 온라인 평가로 확장할 경우 미래 정보 접근을 통제한다.
 
@@ -452,12 +479,16 @@ model:
   cross_attention_order: [zone, type]          # 반대 순서는 Ablation
   ffn_after_each_attention: true
   exclude_target_from_peers: false
+  target_role_embedding: true                  # v1.0: Encoder Token에 대상/Peer Role Embedding (E14 = false)
+  same_building_attention_bias: true           # v1.0: Encoder Self-Attn에 β·1[same building] (E13 = false)
+  same_building_bias_init: 0.0                 # Layer·Head별 학습 스칼라 β의 초기값
+  encoder_peers: all                           # all = E4 / target_only = E1b (Encoder에 대상 건물만)
 data:
   missing_value_strategy: zero_fill       # MVP V1: NaN -> 0 (Attention Mask 아님)
   missing_value_ablation: building_median # V2: 건물별 유효 관측 중앙값
   preserve_observation_mask: true         # 전처리/진단용
   observation_mask_as_feature: false      # MVP 모델 입력에 결측 플래그 미전달
-  missing_reading_loss_policy: to_be_decided
+  missing_reading_loss_policy: include    # [확정] 9.2 결과. exclude_missing은 비교 옵션
 train:
   mode: supervised_end_to_end
   objective: hourly_binary_cross_entropy
@@ -475,11 +506,13 @@ eval:
   metrics_secondary: [f1, precision, recall, pr_auc]
   split_unit: building_id
   peer_pool: train_only                   # 평가 건물 Peer는 학습 건물에서 매칭 (within_split / with_train은 비교 옵션)
-  inference_window_aggregation: to_be_decided
+  window_days: [64, 32, 14, 7, 1]         # 첫 값을 제출·Best Checkpoint 선택에 사용
+  stride_days: null                       # null = 겹치지 않는 Window
+  inference_window_aggregation: mean      # 겹치는 Window를 쓸 때만 평균
   kaggle_submission: row_id_level
 ```
 
-**핵심 초기값:** `d_model=128`, `n_heads=4`, `d_ff=512`, **Zone/Type Encoder 각 2층 + Decoder 2층**, `dropout=0.1`, `T ∼ Uniform{1,…,64}`. 모든 Attention 뒤에 FFN을 사용하며 **Zone → Type Cross-Attention을 순차 적용**한다. Train/Test에서 전체 Encoder+Decoder를 유지하며 시간별 이상을 직접 학습·예측한다. 결측값 대체의 **기본 구현은 V1(0 대체)**이며 **V2(건물별 중앙값 보정)**를 비교한다. 결측 시간 Loss 처리, Overlapping Window 평가 집계, 온라인 확장 여부는 미정이다.
+**핵심 초기값:** `d_model=128`, `n_heads=4`, `d_ff=512`, **Zone/Type Encoder 각 2층 + Decoder 2층**, `dropout=0.1`, `T ∼ Uniform{1,…,64}`. 모든 Attention 뒤에 FFN을 사용하며 **Zone → Type Cross-Attention을 순차 적용**한다. Encoder Token에는 **Role Embedding**, Encoder Self-Attention에는 **동일 건물 Bias**를 사용한다. Train/Test에서 전체 Encoder+Decoder를 유지하며 시간별 이상을 직접 학습·예측한다. 결측값 대체의 **기본 구현은 V1(0 대체)**, 결측 시간도 Loss에 포함한다. 추론은 겹치지 않는 64일 Window를 사용한다. 온라인 확장 여부는 미정이다.
 
 ---
 
@@ -489,6 +522,7 @@ eval:
 |---|---|---|
 | E0 | LEAD 우승 솔루션 재현 | 기존 지도학습 기준 성능 확보 |
 | E1 | Decoder-only Supervised | Zone/Type Context 없는 기준선 |
+| E1b | **Decoder + 대상 건물만 넣은 Zone/Type Encoder** (`encoder_peers: target_only`) | Encoder 경로 자체의 효과와 Peer 정보의 효과를 분리. E1b ≈ E4이면 모델이 Peer를 쓰지 않는다 |
 | E2 | Decoder + Zone Encoder | Zone Context의 기여 평가 |
 | E3 | Decoder + Type Encoder | Type Context의 기여 평가 |
 | E4 | **Decoder + Zone + Type (전체 모델)** | 제안 아키텍처의 기본 성능 |
@@ -500,6 +534,11 @@ eval:
 | E10 | `D`: 64 / 128 / 256 | 표현 차원의 효과 |
 | E11 | **Missing Value V1(0 대체) vs V2(건물별 중앙값 대체)** | 이상 탐지 ROC-AUC, 결측률별 성능, Zero-fill Shortcut 가능성 비교 |
 | E12 | Hourly Anomaly Head 구조 비교 | `Linear(D,24)` vs 원본 24시간 입력을 결합한 Head의 시간별 판별 성능 |
+| E13 | 동일 건물 Attention Bias 사용/제거 | 날짜 간 동일 건물 연결 정보의 효과 (제거 = v0.9 Encoder) |
+| E14 | Target Role Embedding 사용/제거 | 대상 건물 명시의 효과 |
+| E15 | `pos_weight` 크기 (null / 5 / 10 / 45) | 클래스 불균형 가중치의 효과. 확률 분포가 바뀌므로 최적 Threshold F1로 비교 |
+
+- **우선순위:** v1.0 기본 모델(E4 + Bias + Role)을 v0.9 결과(9.2)와 비교한 뒤 E13, E14로 각 구성 요소를 분리하고, **E1 / E1b / E4**로 Peer 기여를 확인한다.
 
 ### 9.1 평가지표
 
@@ -507,6 +546,21 @@ eval:
 - **추가:** Hour-level F1, Precision, Recall, PR-AUC.
 - **일반화:** 미학습 건물 기준 성능을 별도 보고한다.
 - **자원 성능:** 모델 파라미터 수, 추론 시간, 모델 크기 및 그룹 규모(`T×Z`, `T×U`)에 따른 메모리 비용 측정.
+- **Threshold:** F1/Precision/Recall은 0.5 고정값으로 보고하고, 모델 비교에는 Threshold–F1 곡선과 최적 F1을 함께 본다. 검증 정답으로 고른 최적 Threshold는 낙관적인 값이다.
+
+### 9.2 v0.9 결과 (fold 0, 검증 건물 40개, T=64, 10 epoch 마지막 Checkpoint)
+
+| 실험 | ROC-AUC | PR-AUC | F1@0.5 | 최적 F1 (Threshold) |
+|---|---|---|---|---|
+| include + zero_fill (기준) | 0.881 | **0.613** | **0.625** | **0.628** (0.45) |
+| exclude_missing + zero_fill | 0.866 | 0.194 | 0.277 | 0.277 (0.49) |
+| include + building_median (E11) | 0.869 | 0.554 | 0.570 | — |
+| include + zero_fill + `pos_weight=45` | **0.894** | 0.569 | 0.425 | 0.611 (0.96) |
+
+- **결측 Loss 정책:** exclude 모델은 검증 결측 시간(22,988개, 모두 정상)에 평균 확률 0.72를 주었다(include는 0.02). 오탐이 결측 시간에 몰려 PR-AUC가 무너졌으므로 include로 확정한다.
+- **V1 vs V2:** fold 0에서는 0 대체가 중앙값 대체보다 높다. 0 대체가 결측 표시처럼 작동하지만, 이 데이터에서는 결측 시간이 모두 정상이라 그 정보가 맞는 답이다. Test에서도 같은지는 Late Submission으로 확인한다.
+- **pos_weight=45:** ROC-AUC는 약간 높지만 최적 F1과 PR-AUC가 기준보다 낮다. 탐지 성능 개선보다 확률 분포 이동에 가깝다.
+- epoch 간 ROC-AUC가 0.85~0.88 사이로 흔들리므로 0.01 안팎의 차이는 5-fold로 확인한다.
 
 ---
 
@@ -522,7 +576,10 @@ eval:
 - [ ] Train에서는 `[B,T,24]` Logit에 대해 시간별 라벨로 Loss를 계산한다. **이상이 발생한 시간/날짜도 학습 샘플에 포함**한다.
 - [ ] Test에서도 Encoder/Decoder **전체가 작동**하고 `[B,T,24]` Score를 생성한다.
 - [ ] 날짜 `d`의 Decoder **Causal Self-Attention 단독**에서는 미래 날짜를 참조하지 않는다. 단, 전체 모델은 Encoder 때문에 **오프라인/비인과적 모델**임을 테스트/문서에 명시한다.
-- [ ] 같은 날짜의 Peer 입력 순서를 섞어도 마스크를 올바르게 동반한 경우 최종 Prediction이 동일하다(수치 오차 범위).
+- [ ] 같은 날짜의 Peer 입력 순서를 섞어도 마스크를 올바르게 동반한 경우 최종 Prediction이 동일하다(수치 오차 범위). 동일 건물 Bias를 켠 경우 **모든 날짜에 같은 순열**을 적용했을 때 동일해야 한다.
+- [ ] 동일 건물 Bias를 켜면, 한 Peer의 특정 날짜 값을 다른 Peer와 맞바꾼 입력(4.2.1 상황 B)의 Prediction이 원래 입력과 **달라진다**. Bias를 끄면 같다.
+- [ ] Role Embedding은 날짜별 첫 Token(대상)에만 `target`, 나머지 유효 Token에는 `peer`가 더해진다. 학습 파라미터에 건물 수에 비례하는 항이 없다.
+- [ ] `encoder_peers: target_only`이면 두 Encoder 입력이 대상 건물 Token(`T`개)만으로 구성된다.
 - [ ] Train/Validation 건물의 레이블이 분리되고, Test 레이블 없이 그룹 Context와 예측값을 구성한다.
 - [ ] **V1에서는 NaN을 0으로만 대체**, **V2에서는 건물별 유효 관측 중앙값으로 대체**하며, 둘 다 입력 NaN이 없고 `test.csv`의 모든 제출 대상 `row_id`에 점수 1개가 매핑된다. `observation_mask`를 입력 Feature로 넘기거나 결측 시간을 Attention Mask로 제거하지 않는다.
 - [ ] 중복 Window가 동일 행에 점수를 생성하면 사전에 정의한 규칙에 따라 하나로 통합한다.
@@ -533,16 +590,16 @@ eval:
 ## 11. 아직 확정되지 않은 핵심 설계 결정
 
 1. **입력 기간 `T`의 최적화:** 기본은 1~64일 Uniform Sampling으로 시작하며, 성능에 따라 최대 길이와 Sampling 분포 조정.
-2. **실제 결측값 처리:** 기본 구현 V1(0 대체)과 비교 실험 V2(건물별 중앙값 대체)는 정했으나, **더 나은 방식·결측 시간의 Loss 처리·관측 여부 Mask를 Feature로 추가할지**는 미정. Missingness Shortcut을 검증한다.
-3. **중복 Window 추론:** 동일 `row_id`에 여러 Window가 대응할 때 최종 시간별 점수 선택·집계 방식.
-4. **시간별 이상 탐지 Head:** 초기 `Linear(D,24)`와 원본 24시간 입력을 결합하는 Head 등 추가 구조 비교.
-5. **평가 및 운영 범위:** 현재는 Encoder가 Window 전체를 보는 **오프라인/사후 탐지**. 미래 정보를 사용하지 않는 실시간/온라인 탐지는 후속 확장 여부 결정.
-6. **그룹 컨텍스트 설계:** Zone(`site_id`) / Type(`primary_use`)의 Proxy 적합성, Group이 작거나 데이터가 누락된 건물에 대한 처리.
+2. **실제 결측값 처리:** V1(0 대체)이 fold 0에서 앞섰고 결측 시간 Loss는 include로 확정했다. **관측 여부 Mask를 Feature로 추가할지**와 5-fold 기준 V1/V2 최종 선택은 미정.
+3. **시간별 이상 탐지 Head:** 초기 `Linear(D,24)`와 원본 24시간 입력을 결합하는 Head 등 추가 구조 비교.
+4. **평가 및 운영 범위:** 현재는 Encoder가 Window 전체를 보는 **오프라인/사후 탐지**. 미래 정보를 사용하지 않는 실시간/온라인 탐지는 후속 확장 여부 결정.
+5. **그룹 컨텍스트 설계:** Zone(`site_id`) / Type(`primary_use`)의 Proxy 적합성, Group이 작거나 데이터가 누락된 건물에 대한 처리. Peer 실제 기여 여부(E1/E1b/E4).
+6. **Cross-Attention 쪽 건물 정보:** Decoder Query(대상 건물 날짜 `d`)가 Encoder Memory의 대상 Token을 구별하는 데 Role Embedding으로 충분한지, Cross-Attention에도 동일 건물 Bias를 줄지(**[제안]** 후속 옵션).
 
-**이미 확정한 항목:** Train/Test 동일 전체 모델, Hourly Supervised Loss, Zone → Type 순차 Cross-Attention, Attention마다 FFN, 날짜별 공유 PE, `T∈[1,64]` Uniform Sampling, **MVP 결측 0 대체 및 중앙값 보정 비교 버전**, **평가 건물 Peer는 학습 건물에서 매칭**. 위 항목들을 다시 미정으로 표시하지 않는다.
+**이미 확정한 항목:** Train/Test 동일 전체 모델, Hourly Supervised Loss, Zone → Type 순차 Cross-Attention, Attention마다 FFN, 날짜별 공유 PE, `T∈[1,64]` Uniform Sampling, **MVP 결측 0 대체 및 중앙값 보정 비교 버전**, **결측 시간 Loss 포함(include)**, **평가 건물 Peer는 학습 건물에서 매칭**, **겹치지 않는 64일 추론 Window**, **Encoder Role Embedding + 동일 건물 Attention Bias**. 위 항목들을 다시 미정으로 표시하지 않는다.
 
 ---
 
 ## 12. 본 설계의 한 문장 정의
 
-> **하루 24시간 전력량을 1개의 Day Token으로 투영하고, 동일 Zone·Type 건물의 T일치 Token을 날짜별 공유 PE와 함께 두 개의 통합 Encoder에 넣어 관계를 학습한 다음, 대상 건물의 T일 시퀀스를 처리하는 Decoder에서 Zone → Type 순차 Cross-Attention으로 결합하고, 전체 모델을 시간별 이상 레이블로 End-to-End 지도학습하여 각 Day Token마다 24개의 이상 점수를 출력하는 Dual-Context Transformer.**
+> **하루 24시간 전력량을 1개의 Day Token으로 투영하고, 동일 Zone·Type 건물의 T일치 Token을 날짜별 공유 PE·대상/Peer Role Embedding과 함께 두 개의 통합 Encoder에 넣어 동일 건물 Attention Bias로 건물 간 관계와 건물별 날짜 간 패턴을 학습한 다음, 대상 건물의 T일 시퀀스를 처리하는 Decoder에서 Zone → Type 순차 Cross-Attention으로 결합하고, 전체 모델을 시간별 이상 레이블로 End-to-End 지도학습하여 각 Day Token마다 24개의 이상 점수를 출력하는 Dual-Context Transformer.**
