@@ -6,7 +6,7 @@ WAIT=$1
 shift
 cd "$(dirname "$0")/.."
 mkdir -p runs
-touch runs/NO_STOP  # 앞 작업의 run_then_stop.sh가 끝날 때 인스턴스를 끄지 않는다
-while kill -0 "$WAIT" 2>/dev/null; do sleep 30; done
+# 앞 작업의 run_then_stop.sh가 끝날 때 인스턴스를 끄지 않는다. 3개 이상 이을 때 앞 대기열이 지운 NO_STOP을 되살리도록 기다리는 동안 계속 만든다.
+while kill -0 "$WAIT" 2>/dev/null; do touch runs/NO_STOP; sleep 30; done
 rm -f runs/NO_STOP
 exec bash scripts/run_then_stop.sh "$@"
