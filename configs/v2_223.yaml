@@ -1,0 +1,83 @@
+# 실험: 2-2-3 + cosine LR + best.pt F1 기준. v1_dec3.yaml과 output_dir, lr_schedule, warmup_ratio, metric_primary만 다름
+seed: 42
+device: auto
+num_workers: 0
+output_dir: runs/v2_223
+
+cv:
+  n_splits: 5
+  fold: 0                                 # -1 = 200개 전체 학습 후 test 206개 제출 파일 생성
+
+model:
+  d_model: 128
+  n_heads: 4
+  head_dim: 32                            # d_model / n_heads
+  d_ff: 512                               # 4 × d_model
+  zone_encoder_layers: 2
+  type_encoder_layers: 2
+  decoder_layers: 3
+  dropout: 0.1
+  layer_norm: pre                         # [제안] Pre-LN 구현
+  patch_size_hours: 24
+  decoder_window_days: variable           # T를 샘플마다 1~64일 선택 (train 섹션)
+  id_lookup_embedding: false
+  encoder_positional_encoding: shared_sinusoidal_day   # none = E8
+  decoder_positional_encoding: sinusoidal_day
+  encoder_joint_days: true
+  encoder_tokens_layout: day_major
+  target_first_per_day: true
+  encoder_self_attention_temporal_mask: none           # 오프라인 Window 전체 참조
+  decoder_causal_mask: true
+  cross_attention_temporal_mask: none                  # 오프라인 Window 전체 참조
+  cross_attention_fusion: sequential
+  cross_attention_order: [zone, type]     # [type, zone] = E5, [zone]/[type]/[] = E2/E3/E1
+  ffn_after_each_attention: true
+  exclude_target_from_peers: false
+  share_patch_embedding: true             # [제안] Linear(24,D) 공유부터 시작
+  target_role_embedding: true             # v1.0: Encoder Token에 대상/Peer Role Embedding (E14 = false)
+  same_building_attention_bias: true      # v1.0: Encoder Self-Attn에 β·1[같은 건물] (E13 = false)
+  same_building_bias_init: 0.0            # Layer·Head별 학습 스칼라 β의 초기값
+  encoder_peers: all                      # all = E4 / target_only = E1b (Encoder에 대상 건물만)
+
+data:
+  raw_dir: data/raw
+  cache_dir: data/processed
+  missing_value_strategy: zero_fill       # V1: NaN -> 0 / V2(E11): building_median
+  preserve_observation_mask: true         # 전처리/진단용
+  observation_mask_as_feature: false      # MVP 모델 입력에 결측 플래그 미전달
+  missing_reading_loss_policy: include    # [확정] SPEC 9.2. exclude_missing은 비교 옵션
+
+train:
+  mode: supervised_end_to_end
+  objective: hourly_binary_cross_entropy
+  window_length_sampling: uniform_integer
+  min_window_days: 1
+  max_window_days: 64
+  contiguous_window: true
+  match_encoder_decoder_dates: true
+  loss_on: all_valid_hours
+  normal_only: false
+  optimizer: adamw                        # [제안]
+  output_hours_per_day: 24
+  lr: 3.0e-4
+  lr_schedule: cosine                     # constant | cosine (선형 Warmup 후 0까지 코사인 감소)
+  warmup_ratio: 0.02                      # 전체 학습 샘플 중 Warmup 비율
+  weight_decay: 0.01
+  pos_weight: null                        # [미정] 클래스 불균형 가중치, 예: 45
+  batch_size: 32                          # 짧은 T의 최대 배치 크기
+  max_tokens_per_batch: 16384             # 배치 크기 x T x 최대 그룹 크기 상한 (긴 T의 메모리 제한)
+  samples_per_epoch: 20000
+  epochs: 10
+  grad_clip: 1.0
+  log_every: 50
+
+eval:
+  metric_primary: f1                      # best.pt 선택 기준 (window_days[0], threshold 0.5)
+  metrics_secondary: [f1, precision, recall, pr_auc]
+  split_unit: building_id
+  peer_pool: train_only                   # 평가 건물 Peer: train_only(학습 건물에서 매칭) | within_split | with_train
+  window_days: [64, 32, 14, 7, 1]         # E6 고정 길이 평가. 첫 값을 제출에 사용
+  stride_days: null                       # [미정] null = window와 같음(겹침 없음). 작으면 겹치는 Window 평균
+  inference_window_aggregation: mean      # 한 행에 여러 Window가 겹치면 확률 평균
+  threshold: 0.5                          # F1/Precision/Recall용 고정 임계값 (검증 정답으로 튜닝하지 않음)
+  kaggle_submission: row_id_level

@@ -26,6 +26,7 @@ from src.train.common import (
 )
 
 LOSS_POLICIES = ("include", "exclude_missing")
+LR_SCHEDULES = ("constant", "cosine")
 # 평가(검증/테스트) 대상 건물의 Peer를 어디서 가져오는가. 레이블은 어느 경우에도 쓰지 않는다.
 PEER_POOLS = {
     "train_only": "학습 건물에서만 매칭 (학습 때와 같은 Peer 분포)",
@@ -38,6 +39,15 @@ def hourly_loss(logits, target, mask, pos_weight=None):
     """`[B, T, 24]` 시간별 BCE. mask가 False인 시점(정답 Row 없음 등)은 제외한다."""
     loss = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight, reduction="none")
     return (loss * mask).sum() / mask.sum().clamp(min=1)
+
+
+def lr_factor(schedule: str, progress: float, warmup: float) -> float:
+    """학습 진행률(0~1)에서 기본 LR에 곱할 배율. cosine = 선형 Warmup 후 0까지 코사인 감소."""
+    if schedule == "constant":
+        return 1.0
+    if progress < warmup:
+        return progress / warmup
+    return 0.5 * (1.0 + np.cos(np.pi * min((progress - warmup) / (1.0 - warmup), 1.0)))
 
 
 @torch.no_grad()
@@ -128,6 +138,11 @@ def main(argv=None):
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"])
     pos_weight = tcfg.get("pos_weight")
     pos_weight = None if pos_weight is None else torch.tensor(float(pos_weight), device=device)
+    schedule, warmup = tcfg.get("lr_schedule", "constant"), tcfg.get("warmup_ratio", 0.0)
+    if schedule not in LR_SCHEDULES:
+        raise ValueError(f"lr_schedule must be one of {LR_SCHEDULES}")
+    # Batch 크기가 T마다 달라 Step 수가 일정하지 않으므로 본 샘플 수로 진행률을 잰다.
+    total_samples, seen = tcfg["epochs"] * tcfg["samples_per_epoch"], 0
 
     windows = ev["window_days"] if isinstance(ev["window_days"], list) else [ev["window_days"]]
     out = run_dir(cfg, fold)
@@ -153,14 +168,18 @@ def main(argv=None):
         loader = DataLoader(ds_train, batch_sampler=sampler, collate_fn=collate_windows, num_workers=cfg.get("num_workers", 0))
         for step, batch in enumerate(loader):
             batch = to_device(batch, device)
+            lr = tcfg["lr"] * lr_factor(schedule, seen / total_samples, warmup)
+            for g in opt.param_groups:
+                g["lr"] = lr
             logits = model(**model_inputs(batch))
+            seen += logits.shape[0]
             loss = hourly_loss(logits, batch["anomaly_target"], batch["label_mask"], pos_weight)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.get("grad_clip", 1.0))
             opt.step()
             if step % tcfg.get("log_every", 50) == 0:
-                print(f"epoch {epoch} step {step} T={logits.shape[1]} B={logits.shape[0]} loss {loss.item():.4f}")
+                print(f"epoch {epoch} step {step} T={logits.shape[1]} B={logits.shape[0]} lr {lr:.2e} loss {loss.item():.4f}")
 
         if fold >= 0:
             eval_grid = grid.subset(eval_idx)
