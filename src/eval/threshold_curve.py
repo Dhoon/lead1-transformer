@@ -38,10 +38,11 @@ def best_f1(y: np.ndarray, p: np.ndarray) -> dict:
     return {"threshold": float(thr[i]), "f1": float(f1[i]), "precision": float(prec[i]), "recall": float(rec[i])}
 
 
-def evaluate(ckpt_path: Path, window: int, device) -> dict:
+def evaluate(ckpt_path: Path, window: int, device, fold: int | None = None) -> dict:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    fold = cfg["cv"]["fold"]
+    # a92e117 이전 Checkpoint는 --fold로 바꾼 Fold가 config에 남지 않았으므로 --fold로 지정한다.
+    fold = cfg["cv"]["fold"] if fold is None else fold
     model_cfg = ModelConfig.from_dict(ckpt["model_cfg"])
     grid, ds_train, ds_eval, _, eval_idx = prepare(cfg, fold, model_cfg)
     model = DualContextTransformer(model_cfg).to(device)
@@ -79,10 +80,11 @@ def main(argv=None):
     ap.add_argument("checkpoints", nargs="+", type=Path)
     ap.add_argument("--window", type=int, default=64)
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--fold", type=int, default=None, help="기본 = Checkpoint config의 cv.fold")
     args = ap.parse_args(argv)
     device = get_device(args.device)
     for path in args.checkpoints:
-        res = evaluate(path, args.window, device)
+        res = evaluate(path, args.window, device, args.fold)
         path.with_suffix(f".threshold_T{args.window}.json").write_text(json.dumps(res, indent=2))
         b, m = res["best_f1"], res["missing_hours"]
         print(f"\n{path} (epoch {res['epoch']}, T={args.window}) roc {res['roc_auc']:.4f} pr {res['pr_auc']:.4f}")

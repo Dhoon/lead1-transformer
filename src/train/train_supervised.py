@@ -118,6 +118,7 @@ def main(argv=None):
 
     cfg = load_config(args.config)
     fold = cfg["cv"]["fold"] if args.fold is None else args.fold
+    cfg["cv"]["fold"] = fold  # Checkpoint에 실제 학습 Fold를 남긴다 (threshold_curve가 이 값으로 검증 건물을 다시 만든다)
     set_seed(cfg["seed"])
     device = get_device(cfg.get("device", "auto"))
     tcfg, ev = cfg["train"], cfg["eval"]
