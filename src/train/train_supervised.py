@@ -68,8 +68,11 @@ def predict(model, dataset: WindowDataset, batches, device) -> np.ndarray:
     return (total / count).astype(np.float32)
 
 
-def prepare(cfg: dict, fold: int, model_cfg: ModelConfig):
-    """격자 로딩 -> 결측 대체 -> 정규화 -> 그룹 구성. 통계는 Training Fold에서만 추정한다."""
+def prepare(cfg: dict, fold: int, model_cfg: ModelConfig, norm: LogStandardizer | None = None):
+    """격자 로딩 -> 결측 대체 -> 정규화 -> 그룹 구성. 통계는 Training Fold에서만 추정한다.
+
+    norm을 주면 새로 추정하지 않고 그대로 쓴다 (Checkpoint 학습 때의 통계로 추론).
+    """
     data, ev = cfg["data"], cfg["eval"]
     train_grid = load_split(data["raw_dir"], "train", data.get("cache_dir"))
     if fold < 0:
@@ -85,7 +88,8 @@ def prepare(cfg: dict, fold: int, model_cfg: ModelConfig):
 
     observed = grid.observed
     filled = impute_missing(grid.values, data["missing_value_strategy"])  # NaN 없음
-    norm = LogStandardizer().fit(grid.values[train_idx], observed[train_idx])
+    if norm is None:
+        norm = LogStandardizer().fit(grid.values[train_idx], observed[train_idx])
     x = norm.transform(filled)
 
     policy = data["missing_reading_loss_policy"]
