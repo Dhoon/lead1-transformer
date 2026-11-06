@@ -1,4 +1,4 @@
-"""Dual-Context Transformer: Zone/Type Joint Encoder + Temporal Decoder + Hourly Head (SPEC 4)."""
+"""Dual-Context Transformer: Zone/Type Encoder + Temporal Decoder + Hourly Head (SPEC 4)."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
@@ -8,23 +8,33 @@ from torch import nn
 
 from src.models.hourly_head import HourlyAnomalyHead
 from src.models.patch_embedding import DayPatchEmbedding, SinusoidalDayPE
-from src.models.set_encoder import JointDayEncoder
+from src.models.set_encoder import JointDayEncoder, PerDayEncoder
 from src.models.temporal_decoder import TemporalDecoder
 
 CONTEXTS = ("zone", "type")
+ENCODER_SCOPES = ("joint_days", "per_day_buildings")
 
 # SPEC 8.1에서 값이 하나로 확정된 키. 다른 값이 들어오면 구현과 SPEC이 어긋난 것이므로 거부한다.
 FIXED = {
     "patch_size_hours": 24,
     "id_lookup_embedding": False,
     "decoder_window_days": "variable",
-    "encoder_joint_days": True,
     "encoder_tokens_layout": "day_major",
     "target_first_per_day": True,
     "encoder_self_attention_temporal_mask": "none",
     "cross_attention_temporal_mask": "none",
     "cross_attention_fusion": "sequential",
     "exclude_target_from_peers": False,
+}
+# Encoder 방식에 따라 하나로 정해지는 키 (docs/LEAD_Encoder_CrossAttention_Change.md 6장).
+SCOPE_FIXED = {
+    "joint_days": {"encoder_joint_days": True},
+    "per_day_buildings": {
+        "encoder_joint_days": False,
+        "encoder_internal_day_pe": False,
+        "encoder_context_pooling": "target_token",
+        "same_building_attention_bias": False,
+    },
 }
 
 
@@ -50,6 +60,9 @@ class ModelConfig:
     same_building_attention_bias: bool = False  # E13
     same_building_bias_init: float = 0.0
     encoder_peers: str = "all"  # all = E4 / target_only = E1b
+    # 기본값 joint_days = v1.0 Encoder라서 이전 Checkpoint도 그대로 불러온다.
+    encoder_attention_scope: str = "joint_days"  # per_day_buildings = 날짜별 건물 Attention
+    encoder_context_day_pe: str = "sinusoidal"  # per_day_buildings에서 추출한 대상 Context에 더하는 PE (none 가능)
     max_window_days: int = 64
 
     def __post_init__(self):
@@ -63,6 +76,12 @@ class ModelConfig:
             raise ValueError("encoder_positional_encoding: shared_sinusoidal_day | none")
         if self.decoder_positional_encoding not in ("sinusoidal_day", "none"):
             raise ValueError("decoder_positional_encoding: sinusoidal_day | none")
+        if self.encoder_attention_scope not in ENCODER_SCOPES:
+            raise ValueError(f"encoder_attention_scope: {' | '.join(ENCODER_SCOPES)}")
+        if self.encoder_context_day_pe not in ("sinusoidal", "none"):
+            raise ValueError("encoder_context_day_pe: sinusoidal | none")
+        if self.per_day and self.same_building_attention_bias:
+            raise ValueError("per_day_buildings Encoder는 날짜 간 Attention이 없어 동일 건물 Bias를 쓰지 않는다.")
         if self.encoder_peers not in ("all", "target_only"):
             raise ValueError("encoder_peers: all | target_only")
         order = list(self.cross_attention_order)
@@ -74,11 +93,19 @@ class ModelConfig:
         for key, value in FIXED.items():
             if key in cfg and cfg[key] != value:
                 raise ValueError(f"SPEC 확정 항목 {key}={value!r}와 다르다: {cfg[key]!r}")
+        scope = cfg.get("encoder_attention_scope", "joint_days")
+        for key, value in SCOPE_FIXED.get(scope, {}).items():
+            if key in cfg and cfg[key] != value:
+                raise ValueError(f"encoder_attention_scope={scope}이면 {key}={value!r}여야 한다: {cfg[key]!r}")
         names = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in cfg.items() if k in names})
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @property
+    def per_day(self) -> bool:
+        return self.encoder_attention_scope == "per_day_buildings"
 
     @property
     def contexts(self) -> tuple[str, ...]:
@@ -95,14 +122,22 @@ class DualContextTransformer(nn.Module):
         self.patch = DayPatchEmbedding(d)
         self.day_pe = SinusoidalDayPE(d, max_days=max(512, cfg.max_window_days))
         enc_pe = self.day_pe if cfg.encoder_positional_encoding != "none" else None
+        context_pe = self.day_pe if cfg.encoder_context_day_pe != "none" else None
         layers = {"zone": cfg.zone_encoder_layers, "type": cfg.type_encoder_layers}
         # nn.ModuleDict의 "type" 키는 내장 메서드와 충돌하므로 `zone_encoder`/`type_encoder` 속성으로 등록한다.
         for c in cfg.contexts:
             patch = self.patch if cfg.share_patch_embedding else DayPatchEmbedding(d)
-            setattr(self, f"{c}_encoder", JointDayEncoder(
-                patch, enc_pe, d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first,
-                cfg.target_role_embedding, cfg.same_building_attention_bias, cfg.same_building_bias_init,
-            ))
+            if cfg.per_day:
+                encoder = PerDayEncoder(
+                    patch, context_pe, d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first,
+                    cfg.target_role_embedding,
+                )
+            else:
+                encoder = JointDayEncoder(
+                    patch, enc_pe, d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first,
+                    cfg.target_role_embedding, cfg.same_building_attention_bias, cfg.same_building_bias_init,
+                )
+            setattr(self, f"{c}_encoder", encoder)
         self.decoder = TemporalDecoder(
             d, cfg.n_heads, cfg.d_ff, cfg.decoder_layers, cfg.dropout, norm_first,
             cfg.contexts, cfg.ffn_after_each_attention, cfg.decoder_causal_mask,
@@ -117,7 +152,10 @@ class DualContextTransformer(nn.Module):
         type_daily: torch.Tensor | None = None,
         type_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """target_daily: `[B, T, 24]`, {zone,type}_daily: `[B, T, G, 24]`, mask: `[B, T×G]` -> logits `[B, T, 24]`."""
+        """target_daily: `[B, T, 24]`, {zone,type}_daily: `[B, T, G, 24]`, mask: `[B, T×G]` -> logits `[B, T, 24]`.
+
+        Cross-Attention Memory: joint_days = 전체 Token `[B, T×G, D]`, per_day_buildings = 날짜별 대상 Context `[B, T, D]`.
+        """
         h = self.patch(target_daily)
         if self.cfg.decoder_positional_encoding != "none":
             h = h + self.day_pe(h.shape[1])
@@ -127,7 +165,10 @@ class DualContextTransformer(nn.Module):
             daily, mask = given[c]
             if daily is None or mask is None:
                 raise ValueError(f"{c} Encoder가 켜져 있으면 {c}_daily/{c}_mask가 필요하다.")
-            memories[c] = (getattr(self, f"{c}_encoder")(daily, mask), mask)
+            memory = getattr(self, f"{c}_encoder")(daily, mask)
+            if self.cfg.per_day:  # 날짜마다 대상 건물 Context가 항상 있다
+                mask = torch.ones(memory.shape[:2], dtype=torch.bool, device=memory.device)
+            memories[c] = (memory, mask)
         return self.head(self.decoder(h, memories))
 
 

@@ -1,4 +1,8 @@
-"""Joint T-day Zone/Type Encoder + Shared Day PE (SPEC 4.2, 4.3)."""
+"""Zone/Type Encoder (SPEC 4.2, 4.3).
+
+JointDayEncoder: T일 × G건물 통합 Self-Attention (v0.9 / v1.0).
+PerDayEncoder: 날짜별 G건물 Self-Attention + 대상 Context 추출 (docs/LEAD_Encoder_CrossAttention_Change.md).
+"""
 from __future__ import annotations
 
 import torch
@@ -123,3 +127,52 @@ class JointDayEncoder(nn.Module):
             else:
                 h = layer(h, src_key_padding_mask=~mask)
         return self.norm(h)
+
+
+class PerDayEncoder(nn.Module):
+    """날짜마다 같은 날짜의 그룹 건물 G개끼리만 Self-Attention하고, 대상 건물(첫 Token) Context만 꺼낸다.
+
+    (docs/LEAD_Encoder_CrossAttention_Change.md) 모든 날짜에 같은 가중치를 쓴다: `[B, T, G, 24]` -> `[B×T, G, D]`.
+    Encoder 내부에는 날짜 PE가 없고, 추출한 날짜별 대상 Context `[B, T, D]`에 날짜 PE를 더한다.
+    날짜 간 Attention이 없으므로 동일 건물 Bias는 쓰지 않는다.
+    """
+
+    def __init__(
+        self, patch: DayPatchEmbedding, context_pe: SinusoidalDayPE | None,
+        d_model: int, n_heads: int, d_ff: int, n_layers: int, dropout: float, norm_first: bool,
+        role_embedding: bool = True,
+    ):
+        super().__init__()
+        self.patch, self.context_pe = patch, context_pe
+        self.role = nn.Embedding(2, d_model) if role_embedding else None
+        if self.role is not None:
+            nn.init.zeros_(self.role.weight)
+        self.layers = nn.ModuleList(
+            nn.TransformerEncoderLayer(
+                d_model, n_heads, d_ff, dropout, activation="gelu", batch_first=True, norm_first=norm_first
+            )
+            for _ in range(n_layers)
+        )
+        self.norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
+
+    def embed(self, daily: torch.Tensor) -> torch.Tensor:
+        """daily: `[B, T, G, 24]` -> 날짜별 입력 Token `[B×T, G, D]` (날짜 PE 없음)."""
+        b, t, g, _ = daily.shape
+        tokens = self.patch(daily)
+        if self.role is not None:
+            role = torch.full((g,), ROLE_PEER, dtype=torch.long, device=daily.device)
+            role[0] = ROLE_TARGET
+            tokens = tokens + self.role(role)[None, None]
+        return tokens.reshape(b * t, g, -1)
+
+    def forward(self, daily: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """mask: `[B, T×G]` (day-major, True = 유효 Token) -> 날짜별 대상 Context `[B, T, D]`."""
+        b, t, g, _ = daily.shape
+        h = self.embed(daily)
+        pad = ~mask.reshape(b * t, g)
+        for layer in self.layers:
+            h = layer(h, src_key_padding_mask=pad)
+        c = self.norm(h[:, 0]).reshape(b, t, -1)
+        if self.context_pe is not None:
+            c = c + self.context_pe(t)
+        return c
