@@ -1,0 +1,90 @@
+# 실험: 결측 Peer Token을 Attention에서 가림 (data.peer_missing_mask). 나머지는 v5_hour_e20와 같다. 원래 설명: v5_hour와 같고 epochs만 20 (10 epoch에서는 학습량이 v3보다 적어서 확인용)
+# 바뀐 것: Token 1시간, D 64 / d_ff 256, Window 1~168시간, 평가 168시간, Token 예산. 나머지는 v3_perday와 같다.
+seed: 42
+device: auto
+num_workers: 0
+output_dir: runs/v5_hour_pm
+
+cv:
+  n_splits: 5
+  fold: 0                                 # -1 = 200개 전체 학습 후 test 206개 제출 파일 생성
+
+model:
+  token_unit: hour                        # Token = 건물 1개의 1시간 사용량
+  patch_size_hours: 1
+  hour_projection_in_features: 1          # 입력 Projection Linear(1, 64)
+  anomaly_head_out_features: 1            # 출력 Head Linear(64, 1): 시간당 Logit 1개
+  d_model: 64
+  n_heads: 4
+  head_dim: 16                            # d_model / n_heads
+  d_ff: 256                               # 4 × d_model
+  zone_encoder_layers: 2
+  type_encoder_layers: 2
+  decoder_layers: 2
+  dropout: 0.1
+  layer_norm: pre
+  id_lookup_embedding: false
+  decoder_positional_encoding: sinusoidal_hour
+  encoder_attention_scope: per_hour_buildings  # 시간마다 같은 시각의 건물 G개끼리만 Self-Attention
+  encoder_joint_days: false
+  encoder_internal_hour_pe: false         # Encoder 내부 시간 PE 없음
+  encoder_context_hour_pe: sinusoidal     # 추출한 시간별 대상 Context에 시간 PE
+  encoder_context_pooling: target_token   # 시간별 Encoder 출력 중 대상 건물(첫 Token)만 Cross-Attention K/V로
+  encoder_self_attention_temporal_mask: none
+  decoder_causal_mask: true
+  cross_attention_temporal_mask: none     # 오프라인 Window 전체 참조
+  cross_attention_fusion: sequential
+  cross_attention_order: [zone, type]
+  ffn_after_each_attention: true
+  exclude_target_from_peers: false
+  share_patch_embedding: true             # Linear(1,64)를 Zone·Type·Decoder가 공유
+  target_role_embedding: true
+  same_building_attention_bias: false
+  encoder_peers: all
+
+data:
+  raw_dir: data/raw
+  cache_dir: data/processed
+  missing_value_strategy: zero_fill
+  preserve_observation_mask: true
+  observation_mask_as_feature: false
+  missing_reading_loss_policy: include
+  peer_missing_mask: true                 # P시간이 모두 결측인 Peer Token을 Attention Mask에서 제외 (대상 건물은 제외 안 함)
+
+train:
+  mode: supervised_end_to_end
+  objective: hourly_binary_cross_entropy
+  window_length_unit: hours
+  window_length_sampling: uniform_integer
+  min_window_hours: 1
+  max_window_hours: 168                   # T ~ Uniform{1..168}시간, 연속 구간
+  contiguous_window: true
+  match_encoder_decoder_dates: true
+  loss_on: all_valid_hours
+  normal_only: false
+  optimizer: adamw
+  lr: 3.0e-4
+  lr_schedule: cosine
+  warmup_ratio: 0.02
+  weight_decay: 0.01
+  pos_weight: null
+  batch_size: 32
+  # 배치 크기 x T x 최대 그룹 크기 상한. v3(16384)를 그대로 두면 T=168, G=64에서 배치가 1이 된다.
+  # D가 128 -> 64로 줄어 Token당 메모리가 절반이므로 4배로 올려 v3와 비슷한 배치 크기를 유지한다 (T=168에서 B=6).
+  max_tokens_per_batch: 65536
+  samples_per_epoch: 20000
+  epochs: 20
+  grad_clip: 1.0
+  log_every: 50
+
+eval:
+  metric_primary: f1                      # best.pt 선택 기준 (window_hours[0], threshold 0.5)
+  metrics_secondary: [f1, precision, recall, pr_auc]
+  split_unit: building_id
+  peer_pool: train_only
+  window_length_unit: hours
+  window_hours: [168]                     # 겹치지 않는 168시간 고정 Window. 마지막 Window는 남은 시간
+  stride_hours: null                      # null = window와 같음(겹침 없음)
+  inference_window_aggregation: mean
+  threshold: 0.5
+  kaggle_submission: row_id_level

@@ -116,8 +116,9 @@ def prepare(cfg: dict, fold: int, model_cfg: ModelConfig, norm: LogStandardizer 
     ez, et = build_groups(grid, eval_idx, eval_pool, model_cfg)
     p = model_cfg.patch_size_hours
     x, observed, labels, label_mask = (to_token_grid(a, p) for a in (x, observed, labels, label_mask))
-    ds_train = WindowDataset(x, train_idx, tz, tt, observed, labels, label_mask)
-    ds_eval = WindowDataset(x, eval_idx, ez, et, observed)
+    peer_mask = bool(data.get("peer_missing_mask", False))  # 결측 Peer Token을 Attention에서 가린다
+    ds_train = WindowDataset(x, train_idx, tz, tt, observed, labels, label_mask, mask_missing_peers=peer_mask)
+    ds_eval = WindowDataset(x, eval_idx, ez, et, observed, mask_missing_peers=peer_mask)
     return grid, ds_train, ds_eval, norm, eval_idx
 
 

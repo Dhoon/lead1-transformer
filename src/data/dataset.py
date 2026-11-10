@@ -23,6 +23,8 @@ class WindowDataset(Dataset):
     x: 결측 대체·정규화가 끝난 전체 격자 `[n_all, n_steps, P]` (NaN 없음). P = Token당 시간 수.
     targets: 대상 건물 행 인덱스. zone_idx / type_idx: `[len(targets), G]` (열 0 = 대상 건물, -1 = 패딩).
     labels / label_mask: Train에서만 준다. observed: `observation_mask` 보관용 (모델 입력 아님).
+    mask_missing_peers: True면 Token의 P시간이 모두 결측인 Peer를 그 시점의 Attention에서 가린다
+      (`{zone,type}_mask`에서 False). 대상 건물(그룹 열 0)은 결측이어도 가리지 않는다 (Zero-fill 값 그대로).
     """
 
     def __init__(
@@ -34,8 +36,10 @@ class WindowDataset(Dataset):
         observed: np.ndarray,
         labels: np.ndarray | None = None,
         label_mask: np.ndarray | None = None,
+        mask_missing_peers: bool = False,
     ):
         self.x, self.observed = x, observed
+        self.mask_missing_peers = mask_missing_peers
         self.targets = np.asarray(targets)
         self.zone_idx, self.type_idx = zone_idx, type_idx
         self.labels, self.label_mask = labels, label_mask
@@ -55,6 +59,13 @@ class WindowDataset(Dataset):
         members = idx[idx >= 0]
         return torch.from_numpy(np.ascontiguousarray(self.x[members, sl].transpose(1, 0, 2)))  # [T, G, P]
 
+    def _group_valid(self, idx: np.ndarray, sl: slice):
+        """`[T, G]` True = 관측이 하나라도 있는 Token. 열 0(대상 건물)은 항상 True."""
+        members = idx[idx >= 0]
+        valid = self.observed[members, sl].any(-1).T.copy()
+        valid[:, 0] = True
+        return torch.from_numpy(valid)
+
     def __getitem__(self, key) -> dict:
         i, start, t = key
         b = int(self.targets[i])
@@ -65,10 +76,12 @@ class WindowDataset(Dataset):
             "target_row": b,
             "start": start,
         }
-        if self.zone_idx is not None:
-            item["zone_daily"] = self._group(self.zone_idx[i], sl)
-        if self.type_idx is not None:
-            item["type_daily"] = self._group(self.type_idx[i], sl)
+        for name, idx in (("zone", self.zone_idx), ("type", self.type_idx)):
+            if idx is None:
+                continue
+            item[f"{name}_daily"] = self._group(idx[i], sl)
+            if self.mask_missing_peers:
+                item[f"{name}_valid"] = self._group_valid(idx[i], sl)
         if self.labels is not None:
             item["anomaly_target"] = torch.from_numpy(self.labels[b, sl].astype(np.float32))
             item["label_mask"] = torch.from_numpy(self.label_mask[b, sl])
@@ -76,7 +89,10 @@ class WindowDataset(Dataset):
 
 
 def collate_windows(items: list[dict]) -> dict:
-    """같은 T끼리 묶인 배치를 받는다. 그룹 크기 차이만 Padding하고 `[B, T×G]` 유효 Token Mask를 만든다."""
+    """같은 T끼리 묶인 배치를 받는다. 그룹 크기 차이를 Padding하고 `[B, T×G]` 유효 Token Mask를 만든다.
+
+    `{name}_valid`가 있으면(mask_missing_peers) 결측 Peer Token도 Mask에서 False로 둔다.
+    """
     t = items[0]["target_daily"].shape[0]
     assert all(it["target_daily"].shape[0] == t for it in items), "배치 내 T가 같아야 한다."
     out = {k: torch.stack([it[k] for it in items]) for k in ("target_daily", "observation_mask")}
@@ -88,12 +104,12 @@ def collate_windows(items: list[dict]) -> dict:
         groups = [it[f"{name}_daily"] for it in items]
         g = max(x.shape[1] for x in groups)
         daily = torch.zeros(len(items), t, g, groups[0].shape[-1])
-        member = torch.zeros(len(items), g, dtype=torch.bool)
+        member = torch.zeros(len(items), t, g, dtype=torch.bool)
         for k, x in enumerate(groups):
             daily[k, :, : x.shape[1]] = x
-            member[k, : x.shape[1]] = True
+            member[k, :, : x.shape[1]] = items[k][f"{name}_valid"] if f"{name}_valid" in items[k] else True
         out[f"{name}_daily"] = daily
-        out[f"{name}_mask"] = member[:, None, :].expand(-1, t, -1).reshape(len(items), t * g)  # step-major
+        out[f"{name}_mask"] = member.reshape(len(items), t * g)  # step-major
     if "anomaly_target" in items[0]:
         out["anomaly_target"] = torch.stack([it["anomaly_target"] for it in items])
         out["label_mask"] = torch.stack([it["label_mask"] for it in items])
