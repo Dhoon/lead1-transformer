@@ -129,6 +129,9 @@ class JointDayEncoder(nn.Module):
         return self.norm(h)
 
 
+CONTEXT_POOLINGS = ("target_token", "target_plus_peer_mean", "all_buildings")
+
+
 class PerDayEncoder(nn.Module):
     """날짜마다 같은 날짜의 그룹 건물 G개끼리만 Self-Attention하고, 대상 건물(첫 Token) Context만 꺼낸다.
 
@@ -140,10 +143,12 @@ class PerDayEncoder(nn.Module):
     def __init__(
         self, patch: DayPatchEmbedding, context_pe: SinusoidalDayPE | None,
         d_model: int, n_heads: int, d_ff: int, n_layers: int, dropout: float, norm_first: bool,
-        role_embedding: bool = True,
+        role_embedding: bool = True, pooling: str = "target_token",
     ):
         super().__init__()
-        self.patch, self.context_pe = patch, context_pe
+        if pooling not in CONTEXT_POOLINGS:
+            raise ValueError(f"pooling: {' | '.join(CONTEXT_POOLINGS)}")
+        self.patch, self.context_pe, self.pooling = patch, context_pe, pooling
         self.role = nn.Embedding(2, d_model) if role_embedding else None
         if self.role is not None:
             nn.init.zeros_(self.role.weight)
@@ -165,14 +170,40 @@ class PerDayEncoder(nn.Module):
             tokens = tokens + self.role(role)[None, None]
         return tokens.reshape(b * t, g, -1)
 
-    def forward(self, daily: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """mask: `[B, T×G]` (day-major, True = 유효 Token) -> 날짜별 대상 Context `[B, T, D]`."""
+    def forward(self, daily: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """mask: `[B, T×G]` (day-major, True = 유효 Token) -> Cross-Attention (Memory, Memory Mask).
+
+        target_token:          날짜별 대상 Context `[B, T, D]`, Mask 전부 True `[B, T]`.
+        target_plus_peer_mean: 날짜마다 [대상 Context, 유효 Peer 출력 평균] `[B, 2T, D]` (day-major),
+                               Mask `[B, 2T]`. 유효 Peer가 0개인 날짜의 Peer 슬롯은 False.
+                               (docs/LEAD_PeerSummary_2T_CrossAttention_Change.md)
+        all_buildings:         날짜별 Encoder 출력 전체 `[B, T×G, D]` (day-major, 같은 문서 6장 C안),
+                               Mask는 입력 Padding Mask `[B, T×G]` 그대로.
+        두 경우 모두 Encoder 최종 LayerNorm을 거친 출력을 쓰고, 같은 날짜의 슬롯에는 같은 날짜 PE를 더한다.
+        """
         b, t, g, _ = daily.shape
         h = self.embed(daily)
         pad = ~mask.reshape(b * t, g)
         for layer in self.layers:
             h = layer(h, src_key_padding_mask=pad)
-        c = self.norm(h[:, 0]).reshape(b, t, -1)
+        if self.pooling == "target_token":
+            c = self.norm(h[:, 0]).reshape(b, t, -1)
+            if self.context_pe is not None:
+                c = c + self.context_pe(t)
+            return c, torch.ones(b, t, dtype=torch.bool, device=c.device)
+
+        h = self.norm(h).reshape(b, t, g, -1)
+        if self.pooling == "all_buildings":
+            if self.context_pe is not None:
+                h = h + self.context_pe(t)[None, :, None, :]
+            return h.reshape(b, t * g, -1), mask
+        target = h[:, :, 0]                                    # [B, T, D]
+        valid = mask.reshape(b, t, g)[:, :, 1:]                # [B, T, G-1]
+        peer_h = torch.where(valid[..., None], h[:, :, 1:], torch.zeros_like(h[:, :, 1:]))  # Padding 출력 제외
+        count = valid.sum(dim=2)                               # [B, T]
+        peer_mean = peer_h.sum(dim=2) / count.clamp_min(1)[..., None].to(h.dtype)
+        memory = torch.stack([target, peer_mean], dim=2)       # [B, T, 2, D]
         if self.context_pe is not None:
-            c = c + self.context_pe(t)
-        return c
+            memory = memory + self.context_pe(t)[None, :, None, :]
+        memory_mask = torch.stack([torch.ones_like(count, dtype=torch.bool), count > 0], dim=2)
+        return memory.reshape(b, 2 * t, -1), memory_mask.reshape(b, 2 * t)

@@ -54,8 +54,8 @@ def test_shapes_and_memory():
     batch = random_batch(b=3, t=5, z=4, u=6)
     enc = model.zone_encoder
     assert enc.embed(batch["zone_daily"]).shape == (3 * 5, 4, 32)  # [B×T, G, D]
-    assert enc(batch["zone_daily"], batch["zone_mask"]).shape == (3, 5, 32)  # 날짜별 대상 Context
-    assert model.type_encoder(batch["type_daily"], batch["type_mask"]).shape == (3, 5, 32)
+    assert enc(batch["zone_daily"], batch["zone_mask"])[0].shape == (3, 5, 32)  # 날짜별 대상 Context
+    assert model.type_encoder(batch["type_daily"], batch["type_mask"])[0].shape == (3, 5, 32)
     out = model(**batch)
     assert out.shape == (3, 5, 24) and torch.isfinite(out).all()
 
@@ -89,10 +89,10 @@ def test_peer_order_per_day_does_not_change_prediction():
 def test_day_d_context_depends_only_on_day_d():
     enc = per_day_model().zone_encoder
     batch = random_batch(b=2, t=5, z=4, u=6)
-    base = enc(batch["zone_daily"], batch["zone_mask"])
+    base, _ = enc(batch["zone_daily"], batch["zone_mask"])
     changed = batch["zone_daily"].clone()
     changed[:, 2, 1:] += 3.0  # 2일차 Peer만 바꾼다
-    out = enc(changed, batch["zone_mask"])
+    out, _ = enc(changed, batch["zone_mask"])
     others = [0, 1, 3, 4]
     assert torch.allclose(out[:, others], base[:, others], atol=1e-5)
     assert not torch.allclose(out[:, 2], base[:, 2], atol=1e-4)
@@ -105,9 +105,9 @@ def test_context_day_pe_added_after_encoder():
     mask = torch.ones(1, 3 * 4, dtype=torch.bool)
     tokens = enc.embed(daily).reshape(1, 3, 4, -1)
     assert torch.allclose(tokens[0, 0], tokens[0, 1])  # Encoder 입력에는 날짜 PE가 없다
-    c = enc(daily, mask)
+    c, _ = enc(daily, mask)
     assert torch.allclose(c[0, 1] - c[0, 0], model.day_pe(3)[1] - model.day_pe(3)[0], atol=1e-5)
-    no_pe = per_day_model(encoder_context_day_pe="none").zone_encoder(daily, mask)
+    no_pe, _ = per_day_model(encoder_context_day_pe="none").zone_encoder(daily, mask)
     assert torch.allclose(no_pe[0, 0], no_pe[0, 1], atol=1e-6)
 
 

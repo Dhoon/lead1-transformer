@@ -8,7 +8,7 @@ from torch import nn
 
 from src.models.hourly_head import HourlyAnomalyHead
 from src.models.patch_embedding import DayPatchEmbedding, SinusoidalDayPE
-from src.models.set_encoder import JointDayEncoder, PerDayEncoder
+from src.models.set_encoder import CONTEXT_POOLINGS, JointDayEncoder, PerDayEncoder
 from src.models.temporal_decoder import TemporalDecoder
 
 CONTEXTS = ("zone", "type")
@@ -32,7 +32,6 @@ SCOPE_FIXED = {
     "per_day_buildings": {
         "encoder_joint_days": False,
         "encoder_internal_day_pe": False,
-        "encoder_context_pooling": "target_token",
         "same_building_attention_bias": False,
     },
 }
@@ -62,7 +61,13 @@ class ModelConfig:
     encoder_peers: str = "all"  # all = E4 / target_only = E1b
     # 기본값 joint_days = v1.0 Encoder라서 이전 Checkpoint도 그대로 불러온다.
     encoder_attention_scope: str = "joint_days"  # per_day_buildings = 날짜별 건물 Attention
-    encoder_context_day_pe: str = "sinusoidal"  # per_day_buildings에서 추출한 대상 Context에 더하는 PE (none 가능)
+    encoder_context_day_pe: str = "sinusoidal"  # per_day_buildings에서 추출한 날짜별 Context에 더하는 PE (none 가능)
+    # per_day_buildings에서 Cross-Attention K/V로 넘길 날짜별 Context.
+    # target_token = 대상 건물 1개 (KV T개), target_plus_peer_mean = 대상 + 유효 Peer 출력 평균 (KV 2T개),
+    # all_buildings = 날짜별 전체 건물 출력 (KV T×G개)
+    # (docs/LEAD_PeerSummary_2T_CrossAttention_Change.md). 기본값 target_token이라 이전 Checkpoint도 그대로 불러온다.
+    encoder_context_pooling: str = "target_token"
+    cross_attention_memory_layout: str = "day_major_target_peer"  # 2T Memory 배치 [t1, p1, t2, p2, ...]
     max_window_days: int = 64
 
     def __post_init__(self):
@@ -80,6 +85,12 @@ class ModelConfig:
             raise ValueError(f"encoder_attention_scope: {' | '.join(ENCODER_SCOPES)}")
         if self.encoder_context_day_pe not in ("sinusoidal", "none"):
             raise ValueError("encoder_context_day_pe: sinusoidal | none")
+        if self.encoder_context_pooling not in CONTEXT_POOLINGS:
+            raise ValueError(f"encoder_context_pooling: {' | '.join(CONTEXT_POOLINGS)}")
+        if self.encoder_context_pooling != "target_token" and not self.per_day:
+            raise ValueError("encoder_context_pooling은 per_day_buildings Encoder에서만 바꿀 수 있다.")
+        if self.cross_attention_memory_layout != "day_major_target_peer":
+            raise ValueError("cross_attention_memory_layout: day_major_target_peer")
         if self.per_day and self.same_building_attention_bias:
             raise ValueError("per_day_buildings Encoder는 날짜 간 Attention이 없어 동일 건물 Bias를 쓰지 않는다.")
         if self.encoder_peers not in ("all", "target_only"):
@@ -130,7 +141,7 @@ class DualContextTransformer(nn.Module):
             if cfg.per_day:
                 encoder = PerDayEncoder(
                     patch, context_pe, d, cfg.n_heads, cfg.d_ff, layers[c], cfg.dropout, norm_first,
-                    cfg.target_role_embedding,
+                    cfg.target_role_embedding, cfg.encoder_context_pooling,
                 )
             else:
                 encoder = JointDayEncoder(
@@ -154,7 +165,8 @@ class DualContextTransformer(nn.Module):
     ) -> torch.Tensor:
         """target_daily: `[B, T, 24]`, {zone,type}_daily: `[B, T, G, 24]`, mask: `[B, T×G]` -> logits `[B, T, 24]`.
 
-        Cross-Attention Memory: joint_days = 전체 Token `[B, T×G, D]`, per_day_buildings = 날짜별 대상 Context `[B, T, D]`.
+        Cross-Attention Memory: joint_days = 전체 Token `[B, T×G, D]`,
+        per_day_buildings = 날짜별 대상 Context `[B, T, D]` 또는 [대상, Peer 평균] `[B, 2T, D]`.
         """
         h = self.patch(target_daily)
         if self.cfg.decoder_positional_encoding != "none":
@@ -165,10 +177,11 @@ class DualContextTransformer(nn.Module):
             daily, mask = given[c]
             if daily is None or mask is None:
                 raise ValueError(f"{c} Encoder가 켜져 있으면 {c}_daily/{c}_mask가 필요하다.")
-            memory = getattr(self, f"{c}_encoder")(daily, mask)
-            if self.cfg.per_day:  # 날짜마다 대상 건물 Context가 항상 있다
-                mask = torch.ones(memory.shape[:2], dtype=torch.bool, device=memory.device)
-            memories[c] = (memory, mask)
+            encoder = getattr(self, f"{c}_encoder")
+            if self.cfg.per_day:  # Encoder가 Memory Mask를 함께 만든다 (대상 슬롯은 항상 유효)
+                memories[c] = encoder(daily, mask)
+            else:
+                memories[c] = (encoder(daily, mask), mask)
         return self.head(self.decoder(h, memories))
 
 
