@@ -18,7 +18,7 @@ from src.data.dataset import inference_batches
 from src.data.day_patches import LogStandardizer
 from src.eval.kaggle_submission import make_submission
 from src.models.dual_context import DualContextTransformer, ModelConfig
-from src.train.common import get_device, max_group_size
+from src.train.common import get_device, max_group_size, window_steps
 from src.train.train_supervised import predict, prepare
 
 
@@ -36,11 +36,10 @@ def predict_checkpoint(ckpt_path: Path, device, window: int | None = None):
     model = DualContextTransformer(model_cfg).to(device)
     model.load_state_dict(ckpt["model"])
 
-    ev, tcfg = cfg["eval"], cfg["train"]
-    if window is None:
-        window = ev["window_days"][0] if isinstance(ev["window_days"], list) else ev["window_days"]
+    tcfg, win = cfg["train"], window_steps(cfg, model_cfg.patch_size_hours)
+    window = win["eval"][0] if window is None else window
     batches = inference_batches(
-        len(ds_eval), grid.n_days, window, ev.get("stride_days") or window,
+        len(ds_eval), ds_eval.n_steps, window, win["stride"] or window,
         tcfg["batch_size"], max_group_size(ds_eval.zone_idx, ds_eval.type_idx), tcfg.get("max_tokens_per_batch"),
     )
     return predict(model, ds_eval, batches, device), grid.subset(eval_idx), cfg
@@ -50,7 +49,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoints", nargs="+", type=Path)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--window", type=int, default=None, help="기본 = Checkpoint config의 eval.window_days[0]")
+    ap.add_argument("--window", type=int, default=None, help="Token 개수. 기본 = Checkpoint config의 첫 평가 Window")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args(argv)
     device = get_device(args.device)

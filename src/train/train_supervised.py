@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.data.dataset import RandomWindowBatchSampler, WindowDataset, collate_windows, inference_batches
+from src.data.dataset import RandomWindowBatchSampler, WindowDataset, collate_windows, inference_batches, to_token_grid
 from src.data.day_patches import LogStandardizer, impute_missing
 from src.data.lead_loader import concat_grids, load_split
 from src.data.splits import select_fold
@@ -22,7 +22,7 @@ from src.eval.kaggle_submission import make_submission
 from src.eval.metrics import hourly_metrics
 from src.models.dual_context import DualContextTransformer, ModelConfig, model_inputs
 from src.train.common import (
-    build_groups, get_device, load_config, max_group_size, run_dir, set_seed, to_device,
+    build_groups, get_device, load_config, max_group_size, run_dir, set_seed, to_device, window_steps,
 )
 
 LOSS_POLICIES = ("include", "exclude_missing")
@@ -36,7 +36,7 @@ PEER_POOLS = {
 
 
 def hourly_loss(logits, target, mask, pos_weight=None):
-    """`[B, T, 24]` 시간별 BCE. mask가 False인 시점(정답 Row 없음 등)은 제외한다."""
+    """`[B, T, P]` 시간별 BCE (P = Token당 시간 수). mask가 False인 시점(정답 Row 없음 등)은 제외한다."""
     loss = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight, reduction="none")
     return (loss * mask).sum() / mask.sum().clamp(min=1)
 
@@ -52,11 +52,14 @@ def lr_factor(schedule: str, progress: float, warmup: float) -> float:
 
 @torch.no_grad()
 def predict(model, dataset: WindowDataset, batches, device) -> np.ndarray:
-    """모든 Window의 시간별 확률을 행마다 평균해 한 행당 점수 1개를 만든다 (`[n_targets, n_days, 24]`)."""
+    """모든 Window의 시간별 확률을 행마다 평균해 한 행당 점수 1개를 만든다.
+
+    Token 단위 `[n_targets, n_steps, P]`로 모은 뒤 원래 격자 `[n_targets, n_days, 24]`로 되돌린다.
+    """
     model.eval()
     pos = {int(t): i for i, t in enumerate(dataset.targets)}
-    total = np.zeros((len(dataset.targets), dataset.n_days, 24))
-    count = np.zeros((len(dataset.targets), dataset.n_days, 1))
+    total = np.zeros((len(dataset.targets), dataset.n_steps, dataset.patch))
+    count = np.zeros((len(dataset.targets), dataset.n_steps, 1))
     loader = DataLoader(dataset, batch_sampler=batches, collate_fn=collate_windows)
     for batch in loader:
         prob = torch.sigmoid(model(**model_inputs(to_device(batch, device)))).cpu().numpy()
@@ -64,12 +67,14 @@ def predict(model, dataset: WindowDataset, batches, device) -> np.ndarray:
         for k, (row, start) in enumerate(zip(batch["target_row"].tolist(), batch["start"].tolist())):
             total[pos[row], start : start + t] += prob[k]
             count[pos[row], start : start + t] += 1
-    assert (count > 0).all(), "추론 Window가 덮지 못한 날짜가 있다."
-    return (total / count).astype(np.float32)
+    assert (count > 0).all(), "추론 Window가 덮지 못한 시점이 있다."
+    return (total / count).astype(np.float32).reshape(len(dataset.targets), -1, 24)
 
 
 def prepare(cfg: dict, fold: int, model_cfg: ModelConfig, norm: LogStandardizer | None = None):
-    """격자 로딩 -> 결측 대체 -> 정규화 -> 그룹 구성. 통계는 Training Fold에서만 추정한다.
+    """격자 로딩 -> 결측 대체 -> 정규화 -> Token 격자 -> 그룹 구성. 통계는 Training Fold에서만 추정한다.
+
+    반환하는 grid는 원래 `[n, n_days, 24]` 격자다. Dataset 안의 입력·레이블만 `[n, n_steps, P]` Token 격자로 바꾼다.
 
     norm을 주면 새로 추정하지 않고 그대로 쓴다 (Checkpoint 학습 때의 통계로 추론).
     """
@@ -109,6 +114,8 @@ def prepare(cfg: dict, fold: int, model_cfg: ModelConfig, norm: LogStandardizer 
     }[ev["peer_pool"]]
     tz, tt = build_groups(grid, train_idx, train_idx, model_cfg)
     ez, et = build_groups(grid, eval_idx, eval_pool, model_cfg)
+    p = model_cfg.patch_size_hours
+    x, observed, labels, label_mask = (to_token_grid(a, p) for a in (x, observed, labels, label_mask))
     ds_train = WindowDataset(x, train_idx, tz, tt, observed, labels, label_mask)
     ds_eval = WindowDataset(x, eval_idx, ez, et, observed)
     return grid, ds_train, ds_eval, norm, eval_idx
@@ -128,7 +135,9 @@ def main(argv=None):
     tcfg, ev = cfg["train"], cfg["eval"]
     if tcfg.get("normal_only", False):
         raise ValueError("SPEC 5.1: 이상 시간을 포함한 날짜도 학습에 쓴다 (normal_only=false).")
-    model_cfg = ModelConfig.from_dict({**cfg["model"], "max_window_days": tcfg["max_window_days"]})
+    model_cfg = ModelConfig.from_dict(cfg["model"])
+    win = window_steps(cfg, model_cfg.patch_size_hours)  # Window 길이는 모두 Token 개수 (Day: 일, Hour: 시간)
+    model_cfg = ModelConfig.from_dict({**cfg["model"], "max_window_days": max([win["max_t"], *win["eval"]])})
 
     grid, ds_train, ds_eval, norm, eval_idx = prepare(cfg, fold, model_cfg)
     train_group = max_group_size(ds_train.zone_idx, ds_train.type_idx)
@@ -149,7 +158,7 @@ def main(argv=None):
     # Batch 크기가 T마다 달라 Step 수가 일정하지 않으므로 본 샘플 수로 진행률을 잰다.
     total_samples, seen = tcfg["epochs"] * tcfg["samples_per_epoch"], 0
 
-    windows = ev["window_days"] if isinstance(ev["window_days"], list) else [ev["window_days"]]
+    windows = win["eval"]
     out = run_dir(cfg, fold)
     primary = ev.get("metric_primary", "roc_auc")
     history, best = [], None
@@ -166,7 +175,7 @@ def main(argv=None):
     for epoch in range(tcfg["epochs"]):
         model.train()
         sampler = RandomWindowBatchSampler(
-            len(ds_train), grid.n_days, tcfg["min_window_days"], tcfg["max_window_days"],
+            len(ds_train), ds_train.n_steps, win["min_t"], win["max_t"],
             tcfg["samples_per_epoch"], tcfg["batch_size"], train_group, tcfg.get("max_tokens_per_batch"),
             seed=cfg["seed"] + epoch,
         )
@@ -192,7 +201,7 @@ def main(argv=None):
             row = {"epoch": epoch}
             for w in windows:
                 batches = inference_batches(
-                    len(ds_eval), grid.n_days, w, ev.get("stride_days") or w,
+                    len(ds_eval), ds_eval.n_steps, w, win["stride"] or w,
                     tcfg["batch_size"], eval_group, tcfg.get("max_tokens_per_batch"),
                 )
                 prob = predict(model, ds_eval, batches, device)
@@ -200,7 +209,7 @@ def main(argv=None):
             history.append(row)
             print(f"epoch {epoch} eval {json.dumps(row)}")
             (out / "metrics.json").write_text(json.dumps(history, indent=2))
-            # best: 첫 번째 평가 길이(window_days[0])의 metric_primary 기준
+            # best: 첫 번째 평가 길이(eval window[0])의 metric_primary 기준
             score = row[f"T={windows[0]}"].get(primary)
             if score is not None and (best is None or score > best):
                 best = score
@@ -210,7 +219,7 @@ def main(argv=None):
     if fold < 0:
         w = windows[0]
         batches = inference_batches(
-            len(ds_eval), grid.n_days, w, ev.get("stride_days") or w,
+            len(ds_eval), ds_eval.n_steps, w, win["stride"] or w,
             tcfg["batch_size"], eval_group, tcfg.get("max_tokens_per_batch"),
         )
         prob = predict(model, ds_eval, batches, device)

@@ -53,7 +53,7 @@ def test_encoder_first_token_equals_target_same_dates():
 
 def test_sampler_uniform_t_contiguous_windows():
     sampler = RandomWindowBatchSampler(
-        n_targets=5, n_days=366, min_t=1, max_t=64, samples_per_epoch=20000,
+        n_targets=5, n_steps=366, min_t=1, max_t=64, samples_per_epoch=20000,
         batch_size=8, group_size=10, max_tokens=None, seed=0,
     )
     ts = []

@@ -2,6 +2,8 @@
 
 python -m src.eval.threshold_curve runs/fold0/last.pt runs/posw/fold0/last.pt --window 64
 
+--window는 Token 개수다 (Day Token = 일, Hour Token = 시간). 생략하면 Checkpoint config의 첫 평가 Window.
+
 검증 정답으로 고른 최적 Threshold는 낙관적인 값이다 (같은 건물로 고르고 평가). 모델 간 비교용으로만 쓴다.
 """
 from __future__ import annotations
@@ -16,7 +18,7 @@ from sklearn.metrics import average_precision_score, precision_recall_curve, roc
 
 from src.data.dataset import inference_batches
 from src.models.dual_context import DualContextTransformer, ModelConfig
-from src.train.common import get_device, max_group_size
+from src.train.common import get_device, max_group_size, window_steps
 from src.train.train_supervised import predict, prepare
 
 THRESHOLDS = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -38,7 +40,7 @@ def best_f1(y: np.ndarray, p: np.ndarray) -> dict:
     return {"threshold": float(thr[i]), "f1": float(f1[i]), "precision": float(prec[i]), "recall": float(rec[i])}
 
 
-def evaluate(ckpt_path: Path, window: int, device, fold: int | None = None) -> dict:
+def evaluate(ckpt_path: Path, window: int | None, device, fold: int | None = None) -> dict:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     # a92e117 이전 Checkpoint는 --fold로 바꾼 Fold가 config에 남지 않았으므로 --fold로 지정한다.
@@ -48,9 +50,10 @@ def evaluate(ckpt_path: Path, window: int, device, fold: int | None = None) -> d
     model = DualContextTransformer(model_cfg).to(device)
     model.load_state_dict(ckpt["model"])
 
-    tcfg = cfg["train"]
+    tcfg, win = cfg["train"], window_steps(cfg, model_cfg.patch_size_hours)
+    window = win["eval"][0] if window is None else window
     batches = inference_batches(
-        len(ds_eval), grid.n_days, window, cfg["eval"].get("stride_days") or window,
+        len(ds_eval), ds_eval.n_steps, window, win["stride"] or window,
         tcfg["batch_size"], max_group_size(ds_eval.zone_idx, ds_eval.type_idx), tcfg.get("max_tokens_per_batch"),
     )
     prob = predict(model, ds_eval, batches, device)
@@ -78,16 +81,16 @@ def evaluate(ckpt_path: Path, window: int, device, fold: int | None = None) -> d
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoints", nargs="+", type=Path)
-    ap.add_argument("--window", type=int, default=64)
+    ap.add_argument("--window", type=int, default=None)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--fold", type=int, default=None, help="기본 = Checkpoint config의 cv.fold")
     args = ap.parse_args(argv)
     device = get_device(args.device)
     for path in args.checkpoints:
         res = evaluate(path, args.window, device, args.fold)
-        path.with_suffix(f".threshold_T{args.window}.json").write_text(json.dumps(res, indent=2))
+        path.with_suffix(f".threshold_T{res['window']}.json").write_text(json.dumps(res, indent=2))
         b, m = res["best_f1"], res["missing_hours"]
-        print(f"\n{path} (epoch {res['epoch']}, T={args.window}) roc {res['roc_auc']:.4f} pr {res['pr_auc']:.4f}")
+        print(f"\n{path} (epoch {res['epoch']}, T={res['window']}) roc {res['roc_auc']:.4f} pr {res['pr_auc']:.4f}")
         print(f"  best F1 {b['f1']:.4f} @ threshold {b['threshold']:.3f} (P {b['precision']:.3f} R {b['recall']:.3f})")
         for c in res["curve"]:
             print(f"  t={c['threshold']:.2f}  F1 {c['f1']:.4f}  P {c['precision']:.3f}  R {c['recall']:.3f}")

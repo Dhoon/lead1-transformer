@@ -1,4 +1,8 @@
-"""가변 길이 T일 Window Dataset, 샘플러, Collate (SPEC 3.3, 7.3)."""
+"""가변 길이 T Token Window Dataset, 샘플러, Collate (SPEC 3.3, 7.3).
+
+Token 하나는 P시간이다: Day Token P=24 (v3까지), Hour Token P=1 (v5, docs/LEAD_HourLevel_Transformer_v5_Change.md).
+격자는 `[n, n_steps, P]`이고 T, start는 모두 Token 단위다.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -6,10 +10,17 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 
-class WindowDataset(Dataset):
-    """키 `(target_pos, start, T)` -> 대상 건물과 Zone/Type 그룹의 같은 연속 T일.
+def to_token_grid(a: np.ndarray, patch_size_hours: int) -> np.ndarray:
+    """`[n, n_days, 24]` -> `[n, n_days×24/P, P]`. 시간 순서를 그대로 이어 붙이므로 같은 index = 같은 실제 시각이다."""
+    if 24 % patch_size_hours:
+        raise ValueError("patch_size_hours는 24의 약수여야 한다.")
+    return a.reshape(a.shape[0], -1, patch_size_hours)
 
-    x: 결측 대체·정규화가 끝난 전체 격자 `[n_all, n_days, 24]` (NaN 없음).
+
+class WindowDataset(Dataset):
+    """키 `(target_pos, start, T)` -> 대상 건물과 Zone/Type 그룹의 같은 연속 T Token.
+
+    x: 결측 대체·정규화가 끝난 전체 격자 `[n_all, n_steps, P]` (NaN 없음). P = Token당 시간 수.
     targets: 대상 건물 행 인덱스. zone_idx / type_idx: `[len(targets), G]` (열 0 = 대상 건물, -1 = 패딩).
     labels / label_mask: Train에서만 준다. observed: `observation_mask` 보관용 (모델 입력 아님).
     """
@@ -30,15 +41,19 @@ class WindowDataset(Dataset):
         self.labels, self.label_mask = labels, label_mask
 
     @property
-    def n_days(self) -> int:
+    def n_steps(self) -> int:
         return self.x.shape[1]
+
+    @property
+    def patch(self) -> int:
+        return self.x.shape[2]
 
     def __len__(self) -> int:
         return len(self.targets)
 
     def _group(self, idx: np.ndarray, sl: slice):
         members = idx[idx >= 0]
-        return torch.from_numpy(np.ascontiguousarray(self.x[members, sl].transpose(1, 0, 2)))  # [T, G, 24]
+        return torch.from_numpy(np.ascontiguousarray(self.x[members, sl].transpose(1, 0, 2)))  # [T, G, P]
 
     def __getitem__(self, key) -> dict:
         i, start, t = key
@@ -72,13 +87,13 @@ def collate_windows(items: list[dict]) -> dict:
             continue
         groups = [it[f"{name}_daily"] for it in items]
         g = max(x.shape[1] for x in groups)
-        daily = torch.zeros(len(items), t, g, 24)
+        daily = torch.zeros(len(items), t, g, groups[0].shape[-1])
         member = torch.zeros(len(items), g, dtype=torch.bool)
         for k, x in enumerate(groups):
             daily[k, :, : x.shape[1]] = x
             member[k, : x.shape[1]] = True
         out[f"{name}_daily"] = daily
-        out[f"{name}_mask"] = member[:, None, :].expand(-1, t, -1).reshape(len(items), t * g)  # day-major
+        out[f"{name}_mask"] = member[:, None, :].expand(-1, t, -1).reshape(len(items), t * g)  # step-major
     if "anomaly_target" in items[0]:
         out["anomaly_target"] = torch.stack([it["anomaly_target"] for it in items])
         out["label_mask"] = torch.stack([it["label_mask"] for it in items])
@@ -93,17 +108,17 @@ def batch_size_for(t: int, group_size: int, batch_size: int, max_tokens: int | N
 
 
 class RandomWindowBatchSampler(Sampler):
-    """배치마다 T ~ Uniform{min_T..max_T}를 뽑고, 대상 건물과 시작 날짜를 무작위로 고른다.
+    """배치마다 T ~ Uniform{min_T..max_T}를 뽑고, 대상 건물과 시작 Token을 무작위로 고른다.
 
     한 배치 안의 샘플은 같은 T를 공유한다 (SPEC 7.3 구현 주의: 같은 길이끼리 배치 구성).
     """
 
     def __init__(
-        self, n_targets: int, n_days: int, min_t: int, max_t: int, samples_per_epoch: int,
+        self, n_targets: int, n_steps: int, min_t: int, max_t: int, samples_per_epoch: int,
         batch_size: int, group_size: int, max_tokens: int | None, seed: int,
     ):
-        self.n_targets, self.n_days = n_targets, n_days
-        self.min_t, self.max_t = min_t, min(max_t, n_days)
+        self.n_targets, self.n_steps = n_targets, n_steps
+        self.min_t, self.max_t = min_t, min(max_t, n_steps)
         self.samples_per_epoch, self.batch_size = samples_per_epoch, batch_size
         self.group_size, self.max_tokens = group_size, max_tokens
         self.rng = np.random.default_rng(seed)
@@ -114,28 +129,28 @@ class RandomWindowBatchSampler(Sampler):
             t = int(self.rng.integers(self.min_t, self.max_t + 1))
             b = batch_size_for(t, self.group_size, self.batch_size, self.max_tokens)
             targets = self.rng.integers(0, self.n_targets, size=b)
-            starts = self.rng.integers(0, self.n_days - t + 1, size=b)
+            starts = self.rng.integers(0, self.n_steps - t + 1, size=b)
             yield [(int(i), int(s), t) for i, s in zip(targets, starts)]
             seen += b
 
 
-def inference_windows(n_days: int, window: int, stride: int) -> list[tuple[int, int]]:
-    """(start, T) 목록. 모든 날짜를 최소 한 번 덮으며, 마지막 Window는 남은 날짜만큼 짧아질 수 있다."""
+def inference_windows(n_steps: int, window: int, stride: int) -> list[tuple[int, int]]:
+    """(start, T) 목록. 모든 Token을 최소 한 번 덮으며, 마지막 Window는 남은 Token만큼 짧아질 수 있다."""
     if not 0 < stride <= window:
-        raise ValueError("stride는 1 이상 window 이하여야 모든 날짜를 덮는다.")
-    window = min(window, n_days)
-    starts = list(range(0, n_days - window + 1, stride))
-    if starts[-1] + window < n_days:
+        raise ValueError("stride는 1 이상 window 이하여야 모든 Token을 덮는다.")
+    window = min(window, n_steps)
+    starts = list(range(0, n_steps - window + 1, stride))
+    if starts[-1] + window < n_steps:
         starts.append(starts[-1] + stride if stride < window else starts[-1] + window)
-    return [(s, min(window, n_days - s)) for s in starts]
+    return [(s, min(window, n_steps - s)) for s in starts]
 
 
 def inference_batches(
-    n_targets: int, n_days: int, window: int, stride: int, batch_size: int, group_size: int, max_tokens: int | None
+    n_targets: int, n_steps: int, window: int, stride: int, batch_size: int, group_size: int, max_tokens: int | None
 ) -> list[list[tuple[int, int, int]]]:
     """모든 대상 건물 x 추론 Window를 같은 T끼리 배치로 묶는다."""
     by_len: dict[int, list] = {}
-    for s, t in inference_windows(n_days, window, stride):
+    for s, t in inference_windows(n_steps, window, stride):
         by_len.setdefault(t, []).extend((i, s, t) for i in range(n_targets))
     batches = []
     for t, keys in by_len.items():
