@@ -71,6 +71,10 @@ class ModelConfig:
     # (docs/LEAD_PeerSummary_2T_CrossAttention_Change.md). 기본값 target_token이라 이전 Checkpoint도 그대로 불러온다.
     encoder_context_pooling: str = "target_token"
     cross_attention_memory_layout: str = "day_major_target_peer"  # 2T Memory 배치 [t1, p1, t2, p2, ...]
+    # docs/LEAD_v3pm_PeerOnly_AllPeer_Parallel_Change.md: peers_only = Zone/Type Encoder에서 대상 건물을 뺀다.
+    # all_peers Pooling, day_major_peer Layout과 짝이다. 기본값이라 이전 Checkpoint도 그대로 불러온다.
+    encoder_input_scope: str = "target_and_peers"
+    fusion_include_availability: bool = False  # parallel_concat_mlp Fusion 입력에 Branch 존재 플래그 m_zone, m_type 추가
     max_window_days: int = 64
 
     def __post_init__(self):
@@ -92,8 +96,18 @@ class ModelConfig:
             raise ValueError(f"encoder_context_pooling: {' | '.join(CONTEXT_POOLINGS)}")
         if self.encoder_context_pooling != "target_token" and not self.per_day:
             raise ValueError("encoder_context_pooling은 per_day_buildings Encoder에서만 바꿀 수 있다.")
-        if self.cross_attention_memory_layout != "day_major_target_peer":
-            raise ValueError("cross_attention_memory_layout: day_major_target_peer")
+        if self.encoder_input_scope not in ("target_and_peers", "peers_only"):
+            raise ValueError("encoder_input_scope: target_and_peers | peers_only")
+        peers_only = self.encoder_input_scope == "peers_only"
+        if peers_only != (self.encoder_context_pooling == "all_peers"):
+            raise ValueError("encoder_input_scope: peers_only와 encoder_context_pooling: all_peers는 함께 쓴다.")
+        if peers_only and self.target_role_embedding:
+            raise ValueError("peers_only Encoder에는 대상 Token이 없어 target_role_embedding: false여야 한다.")
+        layout = "day_major_peer" if peers_only else "day_major_target_peer"
+        if self.cross_attention_memory_layout != layout:
+            raise ValueError(f"cross_attention_memory_layout: {layout} (encoder_input_scope={self.encoder_input_scope})")
+        if self.fusion_include_availability and self.cross_attention_fusion != "parallel_concat_mlp":
+            raise ValueError("fusion_include_availability는 parallel_concat_mlp에서만 쓴다.")
         if self.per_day and self.same_building_attention_bias:
             raise ValueError("per_day_buildings Encoder는 날짜 간 Attention이 없어 동일 건물 Bias를 쓰지 않는다.")
         if self.encoder_peers not in ("all", "target_only"):
@@ -162,6 +176,7 @@ class DualContextTransformer(nn.Module):
         self.decoder = TemporalDecoder(
             d, cfg.n_heads, cfg.d_ff, cfg.decoder_layers, cfg.dropout, norm_first,
             cfg.contexts, cfg.ffn_after_each_attention, cfg.decoder_causal_mask, cfg.cross_attention_fusion,
+            cfg.fusion_include_availability,
         )
         self.head = HourlyAnomalyHead(d)
 

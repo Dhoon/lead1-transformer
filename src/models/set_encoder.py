@@ -129,7 +129,9 @@ class JointDayEncoder(nn.Module):
         return self.norm(h)
 
 
-CONTEXT_POOLINGS = ("target_token", "target_plus_peer_mean", "all_buildings")
+# all_peers = 대상 건물을 Encoder에서 빼고 날짜별 Peer 출력 전부를 K/V로
+# (docs/LEAD_v3pm_PeerOnly_AllPeer_Parallel_Change.md). encoder_input_scope: peers_only와 짝이다.
+CONTEXT_POOLINGS = ("target_token", "target_plus_peer_mean", "all_buildings", "all_peers")
 
 
 class PerDayEncoder(nn.Module):
@@ -149,6 +151,8 @@ class PerDayEncoder(nn.Module):
         if pooling not in CONTEXT_POOLINGS:
             raise ValueError(f"pooling: {' | '.join(CONTEXT_POOLINGS)}")
         self.patch, self.context_pe, self.pooling = patch, context_pe, pooling
+        if pooling == "all_peers" and role_embedding:
+            raise ValueError("all_peers(Peer-only) Encoder에는 대상 Token이 없어 Role Embedding을 쓰지 않는다.")
         self.role = nn.Embedding(2, d_model) if role_embedding else None
         if self.role is not None:
             nn.init.zeros_(self.role.weight)
@@ -181,6 +185,8 @@ class PerDayEncoder(nn.Module):
                                Mask는 입력 Padding Mask `[B, T×G]` 그대로.
         두 경우 모두 Encoder 최종 LayerNorm을 거친 출력을 쓰고, 같은 날짜의 슬롯에는 같은 날짜 PE를 더한다.
         """
+        if self.pooling == "all_peers":
+            return self._all_peers(daily, mask)
         b, t, g, _ = daily.shape
         h = self.embed(daily)
         pad = ~mask.reshape(b * t, g)
@@ -207,3 +213,29 @@ class PerDayEncoder(nn.Module):
             memory = memory + self.context_pe(t)[None, :, None, :]
         memory_mask = torch.stack([torch.ones_like(count, dtype=torch.bool), count > 0], dim=2)
         return memory.reshape(b, 2 * t, -1), memory_mask.reshape(b, 2 * t)
+
+    def _all_peers(self, daily: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Peer-only Encoder + 전 Peer K/V (docs/LEAD_v3pm_PeerOnly_AllPeer_Parallel_Change.md 3~4장).
+
+        그룹 열 0(대상 건물)을 Encoder 입력에서 뺀다. 날짜별로 유효 Peer끼리만 Self-Attention하고,
+        최종 LN 출력 전부에 날짜 PE를 더해 `[B, T×(G-1), D]` (day-major)로 넘긴다. Mean Pooling 없음.
+        Memory Mask = 입력 Mask의 Peer 부분 (Padding·전체 결측 Peer 날짜는 False).
+        유효 Peer가 0개인 날짜는 전부 가린 Softmax(NaN)를 피하려고 Mask를 풀고 계산한 뒤 Memory Mask에서 뺀다.
+        Peer 슬롯이 하나도 없는 배치는 0 Memory 1개(Mask False)를 돌려준다. 이 경우 Decoder가 Branch를 건너뛴다.
+        """
+        b, t, g, _ = daily.shape
+        valid = mask.reshape(b, t, g)[:, :, 1:]                  # [B, T, G-1]
+        if g == 1:
+            d = self.patch.proj.out_features
+            return daily.new_zeros(b, 1, d), torch.zeros(b, 1, dtype=torch.bool, device=daily.device)
+        gp = g - 1
+        h = self.patch(daily[:, :, 1:]).reshape(b * t, gp, -1)  # Role Embedding 없음 (모두 Peer)
+        pad = ~valid.reshape(b * t, gp)
+        empty = pad.all(dim=1)                                    # 유효 Peer 0개인 (샘플, 날짜)
+        pad = pad & ~empty[:, None]
+        for layer in self.layers:
+            h = layer(h, src_key_padding_mask=pad)
+        h = self.norm(h).reshape(b, t, gp, -1)
+        if self.context_pe is not None:
+            h = h + self.context_pe(t)[None, :, None, :]
+        return h.reshape(b, t * gp, -1), valid.reshape(b, t * gp)

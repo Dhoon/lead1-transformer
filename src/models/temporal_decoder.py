@@ -71,11 +71,20 @@ class ParallelFusionDecoderLayer(nn.Module):
         O_c = CrossAttn_c(Q=Z, K/V=C_c)              c ∈ cross_order, Branch마다 독립 파라미터
         F = MLP([Z; O_zone; O_type])                  (1+n)D -> D -> D
         H_fused = H_self + Drop(F);  out = H_fused + Drop(FFN(LN(H_fused)))
+
+    availability=True (docs/LEAD_v3pm_PeerOnly_AllPeer_Parallel_Change.md 5장):
+        m_c = 샘플 Window 안에 유효 Memory Token이 하나라도 있는가 `[B]`
+        F = MLP([Z; m_zone·O_zone; m_type·O_type; m_zone; m_type])   (1+n)D+n -> D -> D
+        m_c = 0인 샘플은 전부 가린 Softmax(NaN)를 피하려고 Key 하나를 풀어 계산한 뒤 출력을 0으로 바꾼다.
     """
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, cross_order: tuple[str, ...]):
+    def __init__(
+        self, d_model: int, n_heads: int, d_ff: int, dropout: float, cross_order: tuple[str, ...],
+        availability: bool = False,
+    ):
         super().__init__()
         self.cross_order = tuple(cross_order)
+        self.availability = availability
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.self_norm = nn.LayerNorm(d_model)
         self.ffn1 = feed_forward(d_model, d_ff, dropout)
@@ -86,7 +95,8 @@ class ParallelFusionDecoderLayer(nn.Module):
             nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True) for _ in self.cross_order
         )
         self.context_fusion = nn.Sequential(
-            nn.Linear((1 + len(self.cross_order)) * d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model),
+            nn.Linear((1 + len(self.cross_order)) * d_model + (len(self.cross_order) if availability else 0), d_model),
+            nn.GELU(), nn.Linear(d_model, d_model),
         )
         self.ffn2 = feed_forward(d_model, d_ff, dropout)
         self.ffn2_norm = nn.LayerNorm(d_model)
@@ -97,11 +107,20 @@ class ParallelFusionDecoderLayer(nn.Module):
         h = h + self.dropout(self.self_attn(x, x, x, attn_mask=attn_mask, need_weights=False)[0])
         h = h + self.dropout(self.ffn1(self.ffn1_norm(h)))
         z = self.cross_norm(h)
-        outs = []
+        outs, flags = [], []
         for name, attn in zip(self.cross_order, self.cross):
             memory, mask = memories[name]
-            outs.append(attn(z, memory, memory, key_padding_mask=~mask, need_weights=False)[0])  # Cross는 Causal 없음
-        h = h + self.dropout(self.context_fusion(torch.cat([z, *outs], dim=-1)))
+            if not self.availability:
+                outs.append(attn(z, memory, memory, key_padding_mask=~mask, need_weights=False)[0])  # Cross는 Causal 없음
+                continue
+            avail = mask.any(dim=1)                                  # [B]
+            safe = mask.clone()
+            safe[~avail, 0] = True                                   # 빈 샘플: 계산만 하고 아래에서 버린다
+            o = attn(z, memory, memory, key_padding_mask=~safe, need_weights=False)[0]
+            m = avail[:, None, None]
+            outs.append(torch.where(m, o, torch.zeros_like(o)))
+            flags.append(m.to(z.dtype).expand(-1, z.shape[1], 1))
+        h = h + self.dropout(self.context_fusion(torch.cat([z, *outs, *flags], dim=-1)))
         return h + self.dropout(self.ffn2(self.ffn2_norm(h)))
 
 
@@ -109,6 +128,7 @@ class TemporalDecoder(nn.Module):
     def __init__(
         self, d_model: int, n_heads: int, d_ff: int, n_layers: int, dropout: float, norm_first: bool,
         cross_order: tuple[str, ...], ffn_after_each_attention: bool, causal: bool, fusion: str = "sequential",
+        fusion_availability: bool = False,
     ):
         super().__init__()
         self.causal = causal
@@ -116,7 +136,8 @@ class TemporalDecoder(nn.Module):
             if not norm_first:
                 raise ValueError("parallel_concat_mlp는 Pre-LN(layer_norm: pre)에서만 구현했다.")
             self.layers = nn.ModuleList(
-                ParallelFusionDecoderLayer(d_model, n_heads, d_ff, dropout, cross_order) for _ in range(n_layers)
+                ParallelFusionDecoderLayer(d_model, n_heads, d_ff, dropout, cross_order, fusion_availability)
+                for _ in range(n_layers)
             )
         else:
             self.layers = nn.ModuleList(
