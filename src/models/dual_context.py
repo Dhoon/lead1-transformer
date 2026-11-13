@@ -13,6 +13,9 @@ from src.models.temporal_decoder import TemporalDecoder
 
 CONTEXTS = ("zone", "type")
 ENCODER_SCOPES = ("joint_days", "per_day_buildings")
+# Decoder의 Zone/Type Cross-Attention 결합 방식. parallel_concat_mlp =
+# docs/LEAD_v3pm_Parallel_Site_Type_CrossAttention_Change.md
+CROSS_FUSIONS = ("sequential", "parallel_concat_mlp")
 
 # SPEC 8.1에서 값이 하나로 확정된 키. 다른 값이 들어오면 구현과 SPEC이 어긋난 것이므로 거부한다.
 FIXED = {
@@ -23,7 +26,6 @@ FIXED = {
     "target_first_per_day": True,
     "encoder_self_attention_temporal_mask": "none",
     "cross_attention_temporal_mask": "none",
-    "cross_attention_fusion": "sequential",
     "exclude_target_from_peers": False,
 }
 # Encoder 방식에 따라 하나로 정해지는 키 (docs/LEAD_Encoder_CrossAttention_Change.md 6장).
@@ -53,6 +55,7 @@ class ModelConfig:
     decoder_causal_mask: bool = True
     cross_attention_order: list[str] = field(default_factory=lambda: ["zone", "type"])  # E1–E3, E5
     ffn_after_each_attention: bool = True
+    cross_attention_fusion: str = "sequential"  # 기본값 sequential이라 이전 Checkpoint도 그대로 불러온다.
     share_patch_embedding: bool = True  # [제안] Linear(24,D) 공유부터 시작
     # v1.0 (SPEC 4.2.1). 기본값 False = v0.9 Encoder라서 이전 Checkpoint도 그대로 불러온다. configs/train.yaml에서 켠다.
     target_role_embedding: bool = False  # E14
@@ -95,6 +98,13 @@ class ModelConfig:
             raise ValueError("per_day_buildings Encoder는 날짜 간 Attention이 없어 동일 건물 Bias를 쓰지 않는다.")
         if self.encoder_peers not in ("all", "target_only"):
             raise ValueError("encoder_peers: all | target_only")
+        if self.cross_attention_fusion not in CROSS_FUSIONS:
+            raise ValueError(f"cross_attention_fusion: {' | '.join(CROSS_FUSIONS)}")
+        if self.cross_attention_fusion == "parallel_concat_mlp":
+            if self.layer_norm != "pre":
+                raise ValueError("parallel_concat_mlp는 layer_norm: pre에서만 쓴다.")
+            if not self.ffn_after_each_attention:
+                raise ValueError("parallel_concat_mlp는 Self-Attn 뒤 FFN, Fusion 뒤 FFN 구조로 고정이다 (ffn_after_each_attention: true).")
         order = list(self.cross_attention_order)
         if len(set(order)) != len(order) or not set(order) <= set(CONTEXTS):
             raise ValueError(f"cross_attention_order는 {CONTEXTS}의 중복 없는 부분 순열이어야 한다.")
@@ -151,7 +161,7 @@ class DualContextTransformer(nn.Module):
             setattr(self, f"{c}_encoder", encoder)
         self.decoder = TemporalDecoder(
             d, cfg.n_heads, cfg.d_ff, cfg.decoder_layers, cfg.dropout, norm_first,
-            cfg.contexts, cfg.ffn_after_each_attention, cfg.decoder_causal_mask,
+            cfg.contexts, cfg.ffn_after_each_attention, cfg.decoder_causal_mask, cfg.cross_attention_fusion,
         )
         self.head = HourlyAnomalyHead(d)
 

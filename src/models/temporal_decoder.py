@@ -1,4 +1,9 @@
-"""Temporal Decoder: Masked Self-Attn+FFN -> Zone Cross+FFN -> Type Cross+FFN (SPEC 4.4, 4.5)."""
+"""Temporal Decoder (SPEC 4.4, 4.5).
+
+sequential (기본): Masked Self-Attn+FFN -> Zone Cross+FFN -> Type Cross+FFN
+parallel_concat_mlp: Masked Self-Attn+FFN -> [Zone Cross ∥ Type Cross] -> Concat MLP -> FFN
+  (docs/LEAD_v3pm_Parallel_Site_Type_CrossAttention_Change.md)
+"""
 from __future__ import annotations
 
 import torch
@@ -58,17 +63,66 @@ class TemporalDecoderLayer(nn.Module):
         return h
 
 
+class ParallelFusionDecoderLayer(nn.Module):
+    """Site(Zone)/Type Cross-Attention을 같은 Query에서 병렬로 하고 MLP로 합친다 (Pre-LN 전용).
+
+        H_self = h + Drop(SelfAttn(LN(h)));  H_self = H_self + Drop(FFN(LN(H_self)))
+        Z = LN(H_self)
+        O_c = CrossAttn_c(Q=Z, K/V=C_c)              c ∈ cross_order, Branch마다 독립 파라미터
+        F = MLP([Z; O_zone; O_type])                  (1+n)D -> D -> D
+        H_fused = H_self + Drop(F);  out = H_fused + Drop(FFN(LN(H_fused)))
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, cross_order: tuple[str, ...]):
+        super().__init__()
+        self.cross_order = tuple(cross_order)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.self_norm = nn.LayerNorm(d_model)
+        self.ffn1 = feed_forward(d_model, d_ff, dropout)
+        self.ffn1_norm = nn.LayerNorm(d_model)
+        self.cross_norm = nn.LayerNorm(d_model)  # Z = LN(H_self): 두 Branch가 같은 Query 입력을 쓴다
+        # nn.Module에는 type() 메서드가 있어 "type" 이름으로 등록할 수 없으므로 cross_order 순서의 ModuleList로 둔다.
+        self.cross = nn.ModuleList(
+            nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True) for _ in self.cross_order
+        )
+        self.context_fusion = nn.Sequential(
+            nn.Linear((1 + len(self.cross_order)) * d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model),
+        )
+        self.ffn2 = feed_forward(d_model, d_ff, dropout)
+        self.ffn2_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h: torch.Tensor, memories: dict, attn_mask: torch.Tensor | None) -> torch.Tensor:
+        x = self.self_norm(h)
+        h = h + self.dropout(self.self_attn(x, x, x, attn_mask=attn_mask, need_weights=False)[0])
+        h = h + self.dropout(self.ffn1(self.ffn1_norm(h)))
+        z = self.cross_norm(h)
+        outs = []
+        for name, attn in zip(self.cross_order, self.cross):
+            memory, mask = memories[name]
+            outs.append(attn(z, memory, memory, key_padding_mask=~mask, need_weights=False)[0])  # Cross는 Causal 없음
+        h = h + self.dropout(self.context_fusion(torch.cat([z, *outs], dim=-1)))
+        return h + self.dropout(self.ffn2(self.ffn2_norm(h)))
+
+
 class TemporalDecoder(nn.Module):
     def __init__(
         self, d_model: int, n_heads: int, d_ff: int, n_layers: int, dropout: float, norm_first: bool,
-        cross_order: tuple[str, ...], ffn_after_each_attention: bool, causal: bool,
+        cross_order: tuple[str, ...], ffn_after_each_attention: bool, causal: bool, fusion: str = "sequential",
     ):
         super().__init__()
         self.causal = causal
-        self.layers = nn.ModuleList(
-            TemporalDecoderLayer(d_model, n_heads, d_ff, dropout, norm_first, cross_order, ffn_after_each_attention)
-            for _ in range(n_layers)
-        )
+        if fusion == "parallel_concat_mlp":
+            if not norm_first:
+                raise ValueError("parallel_concat_mlp는 Pre-LN(layer_norm: pre)에서만 구현했다.")
+            self.layers = nn.ModuleList(
+                ParallelFusionDecoderLayer(d_model, n_heads, d_ff, dropout, cross_order) for _ in range(n_layers)
+            )
+        else:
+            self.layers = nn.ModuleList(
+                TemporalDecoderLayer(d_model, n_heads, d_ff, dropout, norm_first, cross_order, ffn_after_each_attention)
+                for _ in range(n_layers)
+            )
         self.norm = nn.LayerNorm(d_model) if norm_first else nn.Identity()
 
     def forward(self, h: torch.Tensor, memories: dict) -> torch.Tensor:
