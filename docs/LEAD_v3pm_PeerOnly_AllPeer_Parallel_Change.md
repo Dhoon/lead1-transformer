@@ -306,6 +306,30 @@ data:
 - (B)는 해당 `d`에 유효 Peer가 0개라면 **그 Query에 대한 Branch 출력만 0으로 Mask**해야 한다. 이때 Availability Flag도 `m_g[b,d]` 형태로 날짜별로 정의한다.
 - 실험 시 Same-day 방식을 기본 All-day 방식과 혼합하지 않는다.
 
+**구현 (2026-11-16):** `configs/v3_pm_peeronly_allpeer_parallel_sameday.yaml`. 기본 PeerOnly 설정에서 아래 한 줄만 바꿨다.
+
+```yaml
+model:
+  cross_attention_temporal_mask: same_day   # 기존 확정 키에 값 same_day 추가. 기본값 none
+```
+
+예: `T=3`, Site Peer B·C·D면 K/V는 day-major 9개 `[B1,C1,D1, B2,C2,D2, B3,C3,D3]`이다. Score Mask는 다음과 같다.
+
+\[
+M=
+\begin{bmatrix}
+0&0&0&-\infty&-\infty&-\infty&-\infty&-\infty&-\infty\\
+-\infty&-\infty&-\infty&0&0&0&-\infty&-\infty&-\infty\\
+-\infty&-\infty&-\infty&-\infty&-\infty&-\infty&0&0&0
+\end{bmatrix},
+\qquad O=\operatorname{Softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}+M\right)V
+\]
+
+- 구현은 `[T, T×G]` 날짜 일치 행렬과 Key 유효 Mask(Padding·전체 결측 Peer 날짜)를 AND해서 `nn.MultiheadAttention`의 `attn_mask`(`[B×H, T, T×G]`)로 넘긴다 (`ParallelFusionDecoderLayer._same_day_attention`).
+- 존재 플래그는 날짜별 `m_g[b,d]`다. 그날 유효 Peer가 0개인 Query는 Key 하나를 풀어 계산한 뒤 출력을 0, 플래그를 0으로 바꾼다.
+- `peers_only + all_peers + fusion_include_availability`에서만 허용한다. 대상 Context(`target_token`) 구조에는 쓰지 않는다.
+- 테스트: 1층에서 d일 Peer를 바꾸면 d일 출력만 바뀌는지, 날짜별로 따로 계산한 Attention과 같은지, 빈 날짜의 출력·플래그가 0이고 NaN이 없는지, Peer 순서 불변인지 (`tests/test_peeronly_allpeer.py`의 `test_same_day_*`).
+
 ## 8. 구현 검증 및 비교 실험
 
 ### 필수 테스트
