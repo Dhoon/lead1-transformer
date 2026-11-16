@@ -76,15 +76,22 @@ class ParallelFusionDecoderLayer(nn.Module):
         m_c = 샘플 Window 안에 유효 Memory Token이 하나라도 있는가 `[B]`
         F = MLP([Z; m_zone·O_zone; m_type·O_type; m_zone; m_type])   (1+n)D+n -> D -> D
         m_c = 0인 샘플은 전부 가린 Softmax(NaN)를 피하려고 Key 하나를 풀어 계산한 뒤 출력을 0으로 바꾼다.
+
+    same_day=True (같은 문서 7장 B안): d일 Query는 d일 Peer Key만 본다. Memory는 day-major `[B, T×G, D]`.
+        Score Mask M[d, (d', j)] = 0 if d' = d and 유효, else -inf.
+        m_c는 날짜별 `[B, T]`: 그날 유효 Peer가 하나라도 있는가. 0인 (샘플, 날짜)는 출력 0, 플래그 0.
     """
 
     def __init__(
         self, d_model: int, n_heads: int, d_ff: int, dropout: float, cross_order: tuple[str, ...],
-        availability: bool = False,
+        availability: bool = False, same_day: bool = False,
     ):
         super().__init__()
+        if same_day and not availability:
+            raise ValueError("same_day Cross-Attention은 날짜별 Availability 플래그와 함께 쓴다.")
         self.cross_order = tuple(cross_order)
         self.availability = availability
+        self.same_day = same_day
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.self_norm = nn.LayerNorm(d_model)
         self.ffn1 = feed_forward(d_model, d_ff, dropout)
@@ -113,22 +120,41 @@ class ParallelFusionDecoderLayer(nn.Module):
             if not self.availability:
                 outs.append(attn(z, memory, memory, key_padding_mask=~mask, need_weights=False)[0])  # Cross는 Causal 없음
                 continue
-            avail = mask.any(dim=1)                                  # [B]
-            safe = mask.clone()
-            safe[~avail, 0] = True                                   # 빈 샘플: 계산만 하고 아래에서 버린다
-            o = attn(z, memory, memory, key_padding_mask=~safe, need_weights=False)[0]
-            m = avail[:, None, None]
+            if self.same_day:
+                o, m = self._same_day_attention(attn, z, memory, mask)   # m: [B, T, 1]
+            else:
+                avail = mask.any(dim=1)                                  # [B]
+                safe = mask.clone()
+                safe[~avail, 0] = True                                   # 빈 샘플: 계산만 하고 아래에서 버린다
+                o = attn(z, memory, memory, key_padding_mask=~safe, need_weights=False)[0]
+                m = avail[:, None, None].expand(-1, z.shape[1], 1)
             outs.append(torch.where(m, o, torch.zeros_like(o)))
-            flags.append(m.to(z.dtype).expand(-1, z.shape[1], 1))
+            flags.append(m.to(z.dtype))
         h = h + self.dropout(self.context_fusion(torch.cat([z, *outs, *flags], dim=-1)))
         return h + self.dropout(self.ffn2(self.ffn2_norm(h)))
+
+    @staticmethod
+    def _same_day_attention(attn: nn.MultiheadAttention, z, memory, mask):
+        """z: `[B, T, D]`, memory: `[B, T×G, D]`, mask: `[B, T×G]` -> (출력 `[B, T, D]`, 날짜별 존재 `[B, T, 1]`)."""
+        b, t, _ = z.shape
+        g = memory.shape[1] // t
+        if g * t != memory.shape[1]:
+            raise ValueError("same_day는 day-major T×G Memory가 필요하다.")
+        key_day = torch.arange(t * g, device=z.device) // g                       # [T×G]
+        allowed = (key_day[None, None, :] == torch.arange(t, device=z.device)[None, :, None]) & mask[:, None, :]
+        avail = allowed.any(dim=-1)                                                 # [B, T]
+        safe = allowed.clone()
+        safe[..., 0] |= ~avail                                                      # 빈 (샘플, 날짜): 계산만 하고 버린다
+        block = (~safe).repeat_interleave(attn.num_heads, dim=0)                    # [B×H, T, T×G], True = 차단
+        o = attn(z, memory, memory, attn_mask=block, need_weights=False)[0]
+        return o, avail[..., None]
 
 
 class TemporalDecoder(nn.Module):
     def __init__(
         self, d_model: int, n_heads: int, d_ff: int, n_layers: int, dropout: float, norm_first: bool,
         cross_order: tuple[str, ...], ffn_after_each_attention: bool, causal: bool, fusion: str = "sequential",
-        fusion_availability: bool = False,
+        fusion_availability: bool = False, same_day: bool = False,
     ):
         super().__init__()
         self.causal = causal
@@ -136,7 +162,7 @@ class TemporalDecoder(nn.Module):
             if not norm_first:
                 raise ValueError("parallel_concat_mlp는 Pre-LN(layer_norm: pre)에서만 구현했다.")
             self.layers = nn.ModuleList(
-                ParallelFusionDecoderLayer(d_model, n_heads, d_ff, dropout, cross_order, fusion_availability)
+                ParallelFusionDecoderLayer(d_model, n_heads, d_ff, dropout, cross_order, fusion_availability, same_day)
                 for _ in range(n_layers)
             )
         else:

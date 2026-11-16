@@ -199,3 +199,91 @@ def test_existing_parallel_unchanged():
     model = DualContextTransformer(m)
     assert not model.decoder.layers[0].availability
     assert model.decoder.layers[0].context_fusion[0].in_features == 384
+
+
+# ---- same_day Cross-Attention (docs 7장 B안) ----
+SAME_DAY = {**PEER_ONLY, "cross_attention_temporal_mask": "same_day"}
+
+
+def sd_model(**kw):
+    torch.manual_seed(0)
+    return DualContextTransformer(small_cfg(**{**SAME_DAY, **kw})).eval()
+
+
+def test_same_day_config_file_and_validation():
+    m = ModelConfig.from_dict(load_config("configs/v3_pm_peeronly_allpeer_parallel_sameday.yaml")["model"])
+    assert m.cross_attention_temporal_mask == "same_day" and m.decoder_layers == 2
+    assert all(layer.same_day for layer in DualContextTransformer(m).decoder.layers)
+    with pytest.raises(ValueError):  # target_token 구조에는 same_day 없음
+        small_cfg(encoder_attention_scope="per_day_buildings", cross_attention_fusion="parallel_concat_mlp",
+                  cross_attention_temporal_mask="same_day")
+    with pytest.raises(ValueError):
+        small_cfg(**{**SAME_DAY, "fusion_include_availability": False})
+    assert not po_model().decoder.layers[0].same_day  # 기본 PeerOnly는 전체 날짜
+
+
+def test_same_day_layer_sees_only_same_day_peers():
+    torch.manual_seed(0)
+    layer = ParallelFusionDecoderLayer(16, 4, 32, 0.0, ("zone", "type"), availability=True, same_day=True).eval()
+    t, g = 6, 3
+    h = torch.randn(2, t, 16)
+    mem = {c: (torch.randn(2, t * g, 16), torch.ones(2, t * g, dtype=torch.bool)) for c in ("zone", "type")}
+    mask = torch.triu(torch.ones(t, t, dtype=torch.bool), 1)
+    base = layer(h, mem, mask)
+    for day in (0, 3, 5):
+        mem2 = dict(mem)
+        z = mem["zone"][0].clone()
+        z[:, day * g:(day + 1) * g] += 3.0  # day일 Peer만 바꾼다
+        mem2["zone"] = (z, mem["zone"][1])
+        out = layer(h, mem2, mask)
+        changed = [not torch.allclose(out[:, d], base[:, d], atol=1e-5) for d in range(t)]
+        assert changed == [d == day for d in range(t)]  # 1층에서는 그 날짜 출력만 바뀐다
+
+
+def test_same_day_matches_manual_mask():
+    """Score Mask가 M[d, (d', j)] = 0 if d' = d else -inf 와 같은지 직접 계산과 비교."""
+    torch.manual_seed(0)
+    attn = torch.nn.MultiheadAttention(8, 2, batch_first=True).eval()
+    t, g = 3, 3
+    z, mem = torch.randn(1, t, 8), torch.randn(1, t * g, 8)
+    valid = torch.ones(1, t * g, dtype=torch.bool)
+    o, m = ParallelFusionDecoderLayer._same_day_attention(attn, z, mem, valid)
+    for d in range(t):
+        ref = attn(z[:, d:d + 1], mem[:, d * g:(d + 1) * g], mem[:, d * g:(d + 1) * g], need_weights=False)[0]
+        assert torch.allclose(o[:, d:d + 1], ref, atol=1e-6)
+    assert m.all()
+
+
+def test_same_day_empty_days_zeroed_and_finite():
+    torch.manual_seed(0)
+    model = DualContextTransformer(small_cfg(**SAME_DAY)).train()
+    b, t, z, u = 3, 5, 4, 6
+    batch = random_batch(b=b, t=t, z=z, u=u)
+    zm = batch["zone_mask"].reshape(b, t, z).clone()
+    zm[0, 1:3, 1:] = False  # 샘플 0: 날짜 1, 2에 Zone Peer 없음
+    batch["zone_mask"] = zm.reshape(b, -1)
+    rec = []
+    for layer in model.decoder.layers:
+        layer.context_fusion.register_forward_hook(lambda mod, inp, out: rec.append(inp[0]))
+    out = model(**batch)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    d = 32
+    f_in = rec[0]
+    m_s = f_in[..., 3 * d]
+    assert m_s[0].tolist() == [1, 0, 0, 1, 1] and m_s[-1].eq(0).all()  # 날짜별 플래그, 샘플 -1은 Zone Peer 없음
+    assert torch.equal(f_in[0, 1:3, d:2 * d], torch.zeros(2, d))
+
+
+def test_same_day_no_peer_slots_and_permutation():
+    model = sd_model()
+    assert torch.isfinite(model(**random_batch(z=1, u=1))).all()
+    b, t, u = 3, 5, 6
+    batch = random_batch(b=b, t=t, u=u)
+    base = model(**batch)
+    perm = torch.tensor([0, 3, 5, 1, 4, 2])
+    changed = dict(batch)
+    changed["type_daily"] = batch["type_daily"][:, :, perm]
+    changed["type_mask"] = batch["type_mask"].reshape(b, t, u)[:, :, perm].reshape(b, -1)
+    assert torch.allclose(model(**changed), base, atol=1e-5)

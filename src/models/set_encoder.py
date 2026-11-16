@@ -221,13 +221,13 @@ class PerDayEncoder(nn.Module):
         최종 LN 출력 전부에 날짜 PE를 더해 `[B, T×(G-1), D]` (day-major)로 넘긴다. Mean Pooling 없음.
         Memory Mask = 입력 Mask의 Peer 부분 (Padding·전체 결측 Peer 날짜는 False).
         유효 Peer가 0개인 날짜는 전부 가린 Softmax(NaN)를 피하려고 Mask를 풀고 계산한 뒤 Memory Mask에서 뺀다.
-        Peer 슬롯이 하나도 없는 배치는 0 Memory 1개(Mask False)를 돌려준다. 이 경우 Decoder가 Branch를 건너뛴다.
+        Peer 슬롯이 하나도 없는 배치는 날짜당 0 Memory 1개(`[B, T, D]`, Mask False)를 돌려준다. 이 경우 Decoder가 Branch를 건너뛴다.
         """
         b, t, g, _ = daily.shape
         valid = mask.reshape(b, t, g)[:, :, 1:]                  # [B, T, G-1]
         if g == 1:
             d = self.patch.proj.out_features
-            return daily.new_zeros(b, 1, d), torch.zeros(b, 1, dtype=torch.bool, device=daily.device)
+            return daily.new_zeros(b, t, d), torch.zeros(b, t, dtype=torch.bool, device=daily.device)  # 날짜당 더미 1개
         gp = g - 1
         h = self.patch(daily[:, :, 1:]).reshape(b * t, gp, -1)  # Role Embedding 없음 (모두 Peer)
         pad = ~valid.reshape(b * t, gp)

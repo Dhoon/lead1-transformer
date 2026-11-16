@@ -25,7 +25,6 @@ FIXED = {
     "encoder_tokens_layout": "day_major",
     "target_first_per_day": True,
     "encoder_self_attention_temporal_mask": "none",
-    "cross_attention_temporal_mask": "none",
     "exclude_target_from_peers": False,
 }
 # Encoder 방식에 따라 하나로 정해지는 키 (docs/LEAD_Encoder_CrossAttention_Change.md 6장).
@@ -75,6 +74,8 @@ class ModelConfig:
     # all_peers Pooling, day_major_peer Layout과 짝이다. 기본값이라 이전 Checkpoint도 그대로 불러온다.
     encoder_input_scope: str = "target_and_peers"
     fusion_include_availability: bool = False  # parallel_concat_mlp Fusion 입력에 Branch 존재 플래그 m_zone, m_type 추가
+    # none = Window 전체 날짜 참조. same_day = d일 Query는 d일 Peer만 (같은 문서 7장, all_peers 전용)
+    cross_attention_temporal_mask: str = "none"
     max_window_days: int = 64
 
     def __post_init__(self):
@@ -106,6 +107,10 @@ class ModelConfig:
         layout = "day_major_peer" if peers_only else "day_major_target_peer"
         if self.cross_attention_memory_layout != layout:
             raise ValueError(f"cross_attention_memory_layout: {layout} (encoder_input_scope={self.encoder_input_scope})")
+        if self.cross_attention_temporal_mask not in ("none", "same_day"):
+            raise ValueError("cross_attention_temporal_mask: none | same_day")
+        if self.cross_attention_temporal_mask == "same_day" and not (peers_only and self.fusion_include_availability):
+            raise ValueError("same_day는 peers_only + all_peers + fusion_include_availability에서만 쓴다.")
         if self.fusion_include_availability and self.cross_attention_fusion != "parallel_concat_mlp":
             raise ValueError("fusion_include_availability는 parallel_concat_mlp에서만 쓴다.")
         if self.per_day and self.same_building_attention_bias:
@@ -176,7 +181,7 @@ class DualContextTransformer(nn.Module):
         self.decoder = TemporalDecoder(
             d, cfg.n_heads, cfg.d_ff, cfg.decoder_layers, cfg.dropout, norm_first,
             cfg.contexts, cfg.ffn_after_each_attention, cfg.decoder_causal_mask, cfg.cross_attention_fusion,
-            cfg.fusion_include_availability,
+            cfg.fusion_include_availability, cfg.cross_attention_temporal_mask == "same_day",
         )
         self.head = HourlyAnomalyHead(d)
 
